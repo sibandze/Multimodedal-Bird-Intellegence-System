@@ -4,6 +4,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -46,6 +47,7 @@ def supervised_val_collate_fn(batch):
 def aggregate_recordings(logits_all, labels_all, recording_ids_all):
     """
     Aggregate window-level outputs to recording-level predictions.
+    O(n) via grouping; avoids repeated full-array scans.
 
     Args:
         logits_all: tensor of shape [total_windows, num_classes]
@@ -57,26 +59,19 @@ def aggregate_recordings(logits_all, labels_all, recording_ids_all):
         rec_targets: tensor of true labels [num_recordings]
         rec_logits: tensor of averaged logits [num_recordings, num_classes]
     """
+    # Group window indices by recording ID
+    groups = defaultdict(list)
+    for i, rec_id in enumerate(recording_ids_all):
+        groups[str(rec_id)].append(i)
+
     rec_ids = []
     rec_targets = []
     rec_logits = []
 
-    # Convert recording_ids to strings for consistent grouping
-    rec_ids_str = [str(r) for r in recording_ids_all]
-
-    unique_ids = []
-    for r in rec_ids_str:
-        if r not in unique_ids:
-            unique_ids.append(r)
-
-    for rec_id in unique_ids:
-        mask = np.array([r == rec_id for r in rec_ids_str])
-        avg_logits = logits_all[mask].mean(dim=0)  # [num_classes]
-        true_label = labels_all[mask][0]  # all same for a recording
-
+    for rec_id, indices in groups.items():
         rec_ids.append(rec_id)
-        rec_targets.append(true_label.item())
-        rec_logits.append(avg_logits)
+        rec_targets.append(labels_all[indices[0]].item())
+        rec_logits.append(logits_all[indices].mean(dim=0))
 
     rec_targets = torch.tensor(rec_targets, dtype=torch.long)
     rec_logits = torch.stack(rec_logits, dim=0)
@@ -113,7 +108,6 @@ class SupervisedExperimentTrainer:
         self.best_epoch = 0
         self.stop_training = False
 
-        # Callback order matters! EarlyStopping and Checkpoint come before Loggers
         if callbacks is None:
             callbacks = [
                 CheckpointCallback(self.run_dir, monitor="val_acc", mode="max"),
@@ -129,7 +123,6 @@ class SupervisedExperimentTrainer:
             ]
         self.cb_runner = CallbackRunner(callbacks)
 
-        # Store environment state
         try:
             self.git_hash = (
                 subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
@@ -147,19 +140,19 @@ class SupervisedExperimentTrainer:
         segment_size = self.config["audio"]["segment_size"]
         window_config = self.config["window"]
 
-        # Recording-level train/val/test split (70/15/15 by default)
+        # Use experiment seed if available
+        seed = self.config.get("experiment", {}).get("seed", 42)
+
         test_size = self.config["training"].get("test_size", 0.15)
         val_size = self.config["training"].get("val_size", 0.15)
 
-        # Dynamically compute minimum recordings needed per class for evaluation splits
         min_eval_split = min(val_size, test_size)
         if min_eval_split <= 0:
             raise ValueError("val_size and test_size must be > 0")
 
-        # Required so that each split gets at least one sample per class
         MIN_RECORDINGS_FOR_EVAL = (
             int(np.ceil(1.0 / min_eval_split)) + 1
-        )  # +1 safety margin
+        )
 
         counts = df["scientific_name_id"].value_counts()
 
@@ -169,25 +162,33 @@ class SupervisedExperimentTrainer:
         eval_df = df[df["scientific_name_id"].isin(eval_classes)].copy()
         rare_df = df[df["scientific_name_id"].isin(rare_classes)].copy()
 
-        train_df, temp_df = train_test_split(
-            eval_df,
-            test_size=val_size + test_size,
-            random_state=42,
-            stratify=eval_df["scientific_name_id"],
-        )
+        # Guard: if all classes are rare, fall back to train-only with no eval splits
+        if len(eval_df) == 0:
+            print(
+                f"WARNING: All {len(rare_classes)} classes have fewer than "
+                f"{MIN_RECORDINGS_FOR_EVAL} recordings. "
+                f"Training without validation/test split."
+            )
+            train_df = rare_df.copy()
+            val_df = rare_df.iloc[:0].copy()   # empty, same columns
+            test_df = rare_df.iloc[:0].copy()
+        else:
+            train_df, temp_df = train_test_split(
+                eval_df,
+                test_size=val_size + test_size,
+                random_state=seed,
+                stratify=eval_df["scientific_name_id"],
+            )
 
-        val_df, test_df = train_test_split(
-            temp_df,
-            test_size=test_size / (val_size + test_size),
-            random_state=42,
-            stratify=temp_df["scientific_name_id"],
-        )
+            val_df, test_df = train_test_split(
+                temp_df,
+                test_size=test_size / (val_size + test_size),
+                random_state=seed,
+                stratify=temp_df["scientific_name_id"],
+            )
 
-        # Keep all rare recordings for training
-        train_df = pd.concat(
-            [train_df, rare_df],
-            ignore_index=True,
-        )
+            # Keep all rare recordings for training
+            train_df = pd.concat([train_df, rare_df], ignore_index=True)
 
         train_dataset = SupervisedBirdSongDataset(
             df=train_df,
@@ -208,7 +209,7 @@ class SupervisedExperimentTrainer:
             max_db=self.config["audio"]["max_db"],
             window_config={
                 "strategy": "sliding",
-                "stride": segment_size,  # non-overlapping windows for validation
+                "stride": segment_size,
             },
             return_recording_id=True,
         )
@@ -281,6 +282,16 @@ class SupervisedExperimentTrainer:
         )
         class_names = [idx_to_label[i] for i in range(len(idx_to_label))]
 
+        # Save label mappings alongside the run for reproducibility
+        import json
+        label_map_path = self.run_dir / "label_mappings.json"
+        label_map_path.write_text(
+            json.dumps(
+                {"label_to_idx": label_to_idx, "idx_to_label": idx_to_label},
+                indent=2,
+            )
+        )
+
         segment_size = self.config["audio"]["segment_size"]
 
         # Initialize Model
@@ -304,7 +315,8 @@ class SupervisedExperimentTrainer:
         print(f"    Params:    {num_params:,} (Trainable: {trainable_params:,})")
         print(f"    Classes:   {len(class_names)}")
         print(f"    Train samples: {len(train_loader.dataset)}")
-        print(f"    Test samples:  {len(val_loader.dataset)}")
+        print(f"    Val samples:   {len(val_loader.dataset)}")
+        print(f"    Test samples:  {len(test_loader.dataset)}")
 
         if compiled:
             self.model = torch.compile(self.model)
@@ -330,7 +342,7 @@ class SupervisedExperimentTrainer:
         )
         step_frequency = get_scheduler_step_frequency(scheduler_type)
 
-        # Checkpoint Resumption Logic
+        # Checkpoint Resumption
         resume_epoch = 0
         checkpoint_path = self.run_dir / "checkpoint_last.pth"
         if checkpoint_path.exists():
@@ -362,25 +374,27 @@ class SupervisedExperimentTrainer:
         # Trigger Train Begin Callbacks
         self.cb_runner.on_train_begin(self)
 
+        # =========================================================
+        # Main training loop
+        # =========================================================
         for epoch in range(resume_epoch, epochs):
             if self.stop_training:
                 break
 
-            # Update window indices for sliding window strategy
             train_loader.dataset.set_epoch(epoch)
 
             self.cb_runner.on_epoch_begin(self, epoch)
             epoch_start_time = time.time()
 
-            # --- Training Phase ---
+            # ---------------------------------------------------
+            # TRAINING PHASE
+            # ---------------------------------------------------
             self.model.train()
-            train_loss, train_correct, train_total, epoch_grad_norm, num_batches = (
-                0.0,
-                0,
-                0,
-                0.0,
-                0,
-            )
+            train_loss = 0.0
+            train_correct = 0
+            train_total = 0
+            epoch_grad_norm = 0.0
+            num_batches = 0
 
             for batch_idx, (mel_segments, labels) in enumerate(
                 tqdm(
@@ -390,9 +404,8 @@ class SupervisedExperimentTrainer:
                 batch_start_logs = {"batch": batch_idx}
                 self.cb_runner.on_batch_begin(self, batch_idx, batch_start_logs)
 
-                mel_segments, labels = mel_segments.to(self.device), labels.to(
-                    self.device
-                )
+                mel_segments = mel_segments.to(self.device)
+                labels = labels.to(self.device)
                 self.optimizer.zero_grad(set_to_none=True)
 
                 with self.precision.autocast():
@@ -429,98 +442,98 @@ class SupervisedExperimentTrainer:
                 }
                 self.cb_runner.on_batch_end(self, batch_idx, batch_end_logs)
 
-                # --- Validation Phase ---
-                self.cb_runner.on_validation_begin(self)
-                self.model.eval()
-                val_loss = 0.0
-                val_correct_window = 0
-                val_total_windows = 0
+            # ---------------------------------------------------
+            # VALIDATION PHASE  (once per epoch, outside batch loop)
+            # ---------------------------------------------------
+            self.cb_runner.on_validation_begin(self)
+            self.model.eval()
 
-                all_logits = []
-                all_labels = []
-                all_rec_ids = []
+            val_loss_total = 0.0
+            val_correct_window = 0
+            val_total_windows = 0
 
-                with torch.no_grad():
-                    for batch_idx, (mel_segments, labels, recording_ids) in enumerate(
-                        tqdm(
-                            val_loader,
-                            desc=f"Epoch {epoch+1}/{epochs} [Val]",
-                            leave=False,
-                        )
-                    ):
-                        mel_segments = mel_segments.to(self.device)
-                        labels = labels.to(self.device)
+            all_logits = []
+            all_labels = []
+            all_rec_ids = []
 
-                        with self.precision.autocast():
-                            logits = self.model(mel_segments)
+            with torch.no_grad():
+                for val_batch_idx, (mel_segments, labels, recording_ids) in enumerate(
+                    tqdm(
+                        val_loader,
+                        desc=f"Epoch {epoch+1}/{epochs} [Val]",
+                        leave=False,
+                    )
+                ):
+                    mel_segments = mel_segments.to(self.device)
+                    labels = labels.to(self.device)
 
-                        # Window-level metrics
-                        loss = criterion(logits, labels)
-                        val_loss += loss.item() * labels.size(0)
-                        preds = torch.argmax(logits, dim=1)
-                        val_correct_window += (preds == labels).sum().item()
-                        val_total_windows += labels.size(0)
+                    with self.precision.autocast():
+                        logits = self.model(mel_segments)
 
-                        all_logits.append(logits.detach().cpu())
-                        all_labels.append(labels.cpu())
-                        all_rec_ids.extend(recording_ids)  # recording_ids is a list
+                    loss = criterion(logits, labels)
+                    val_loss_total += loss.item() * labels.size(0)
+                    preds = torch.argmax(logits, dim=1)
+                    val_correct_window += (preds == labels).sum().item()
+                    val_total_windows += labels.size(0)
 
-                # Concatenate
+                    all_logits.append(logits.detach().cpu())
+                    all_labels.append(labels.cpu())
+                    all_rec_ids.extend(recording_ids)
+
+            # Aggregate to recording level
+            if val_total_windows > 0:
                 all_logits = torch.cat(all_logits, dim=0)
                 all_labels = torch.cat(all_labels, dim=0)
 
-                # Aggregate to recording level
                 rec_ids, rec_targets, rec_logits = aggregate_recordings(
                     all_logits, all_labels, all_rec_ids
                 )
 
-                # Recording-level loss and accuracy
-                if len(rec_targets) > 0:
-                    rec_loss = criterion(
-                        rec_logits.to(self.device), rec_targets.to(self.device)
-                    )
-                    avg_val_loss = rec_loss.item()
-                    rec_preds = rec_logits.argmax(dim=1).cpu()
-                    val_acc = (rec_preds == rec_targets).float().mean().item()
-                else:
-                    avg_val_loss = 0.0
-                    val_acc = 0.0
-
-            # Window-level accuracy for diagnostics
-            val_window_acc = (
-                val_correct_window / val_total_windows if val_total_windows > 0 else 0.0
-            )
+                rec_loss = criterion(
+                    rec_logits.to(self.device), rec_targets.to(self.device)
+                )
+                avg_val_loss = rec_loss.item()
+                rec_preds = rec_logits.argmax(dim=1).cpu()
+                val_acc = (rec_preds == rec_targets).float().mean().item()
+                val_window_acc = val_correct_window / val_total_windows
+            else:
+                avg_val_loss = 0.0
+                val_acc = 0.0
+                val_window_acc = 0.0
 
             val_logs = {
-                "val_loss": avg_val_loss,  # recording-level loss
-                "val_acc": val_acc,  # recording-level accuracy
-                "val_window_acc": val_window_acc,  # window-level accuracy (for reference)
+                "val_loss": avg_val_loss,
+                "val_acc": val_acc,
+                "val_window_acc": val_window_acc,
             }
             self.cb_runner.on_validation_end(self, val_logs)
 
+            # ---------------------------------------------------
+            # SCHEDULER (epoch-level)
+            # ---------------------------------------------------
             if self.scheduler and step_frequency == "epoch":
                 if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step(avg_val_loss)
                 else:
                     self.scheduler.step()
 
-            # Construct Epoch Metrics Dictionary
+            # ---------------------------------------------------
+            # EPOCH LOGGING
+            # ---------------------------------------------------
             epoch_duration = time.time() - epoch_start_time
             logs = {
                 "epoch": epoch + 1,
-                "train_loss": train_loss / train_total,
-                "train_acc": train_correct / train_total,
+                "train_loss": train_loss / max(train_total, 1),
+                "train_acc": train_correct / max(train_total, 1),
                 "val_loss": avg_val_loss,
                 "val_acc": val_acc,
                 "learning_rate": self.optimizer.param_groups[0]["lr"],
                 "precision": self.precision.precision_name(),
                 "loss_scale": self.precision.current_scale(),
-                "grad_norm": epoch_grad_norm / num_batches,
+                "grad_norm": epoch_grad_norm / max(num_batches, 1),
                 "epoch_time_sec": epoch_duration,
-                "samples_per_sec": train_total / epoch_duration,
+                "samples_per_sec": train_total / max(epoch_duration, 1e-9),
             }
-
-            # Memory usage logging
             logs.update(get_gpu_memory_info(self.device))
 
             print(
@@ -529,15 +542,20 @@ class SupervisedExperimentTrainer:
                 f"Val Loss: {logs['val_loss']:.4f} | Val Acc: {logs['val_acc']:.4f}"
             )
 
-            # Notify Epoch End Callbacks
             self.cb_runner.on_epoch_end(self, epoch, logs)
 
-        # Run Test Evaluation on Best Weights
-        best_ckpt = torch.load(self.run_dir / "checkpoint_best.pth", weights_only=False)
-        self.model.load_state_dict(best_ckpt["model_state_dict"])
-        metrics = self._evaluate(self.model, val_loader, class_names)
+        # =========================================================
+        # Final evaluation on TEST set using best checkpoint
+        # =========================================================
+        best_ckpt_path = self.run_dir / "checkpoint_best.pth"
+        if not best_ckpt_path.exists():
+            print("WARNING: No best checkpoint found. Using current model weights.")
+            metrics = self._evaluate(self.model, test_loader, class_names)
+        else:
+            best_ckpt = torch.load(best_ckpt_path, weights_only=False)
+            self.model.load_state_dict(best_ckpt["model_state_dict"])
+            metrics = self._evaluate(self.model, test_loader, class_names)
 
-        # Trigger Train End Callbacks
         self.cb_runner.on_train_end(self)
         return metrics
 
