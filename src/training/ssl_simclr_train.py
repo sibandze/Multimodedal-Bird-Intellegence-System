@@ -31,7 +31,7 @@ from src.training.callbacks import (
 
 class SimCLRExperimentTrainer:
     """
-    Trainer for self‑supervised contrastive learning with SimCLR.
+    Trainer for self-supervised contrastive learning with SimCLR.
     Trains an encoder + projection head, then evaluates using a linear probe
     on the frozen encoder (optional, can be added later).
     """
@@ -93,12 +93,14 @@ class SimCLRExperimentTrainer:
         segment_size = self.config["audio"]["segment_size"]
         window_config = self.config.get("window", {})
 
-        # For SSL we typically use the whole dataset (or a large unlabelled subset)
-        # Here we use the full provided dataframe as training set.
-        # Validation can be a small random subset to monitor loss.
         from sklearn.model_selection import train_test_split
 
-        train_df, val_df = train_test_split(df, test_size=0.05, random_state=42)
+        # Use experiment seed if available, otherwise fall back to 42
+        seed = self.config.get("experiment", {}).get("seed", 42)
+
+        train_df, val_df = train_test_split(
+            df, test_size=0.05, random_state=seed
+        )
 
         train_dataset = SimCLRDataset(
             df=train_df,
@@ -171,10 +173,15 @@ class SimCLRExperimentTrainer:
             hidden_dim=proj_cfg.get("hidden_dim", 256),
             output_dim=proj_cfg.get("output_dim", 128),
         )
+
+        # FIX: Read temperature from training config, not root config.
+        # Sweep system writes to config["training"]["temperature"].
+        temperature = self.config["training"].get("temperature", 0.07)
+
         model = SimCLR(
             encoder=encoder,
             projection=projection,
-            temperature=self.config.get("temperature", 0.07),
+            temperature=temperature,
         )
         return model.to(self.device)
 
@@ -192,6 +199,7 @@ class SimCLRExperimentTrainer:
         print(f"    Trainable params: {num_params:,}")
         print(f"    Train samples: {len(train_loader.dataset)}")
         print(f"    Val samples: {len(val_loader.dataset)}")
+        print(f"    Temperature: {self.model.temperature}")
 
         self.optimizer = optim.AdamW(
             self.model.parameters(),
@@ -235,7 +243,6 @@ class SimCLRExperimentTrainer:
             if self.stop_training:
                 break
 
-            # Update dataset epoch (if sliding windows)
             train_loader.dataset.set_epoch(epoch)
 
             self.cb_runner.on_epoch_begin(self, epoch)
@@ -260,18 +267,16 @@ class SimCLRExperimentTrainer:
 
                 self.precision.scale_loss(loss).backward()
 
-                grad_clip = self.config["training"].get("gradient_clip")
+                # FIX: Always unscale gradients before clipping.
+                # Under mixed precision, gradients are scaled; clipping
+                # without unscaling clips the wrong magnitudes.
+                self.precision.unscale_gradients(self.optimizer)
 
-                if grad_clip is not None:
-                    grad_norm = self.precision.clip_gradient(
-                        self.optimizer,
-                        self.model.parameters(),
-                        grad_clip,
-                    ).item()
-                else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), max_norm=float("inf")
-                    ).item()
+                grad_clip = self.config["training"].get("gradient_clip")
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=grad_clip if grad_clip is not None else float("inf"),
+                ).item()
 
                 grad_norm_sum += grad_norm
 
@@ -287,8 +292,8 @@ class SimCLRExperimentTrainer:
 
                 pbar.set_postfix(loss=loss.item(), acc=acc.item())
 
-            avg_train_loss = train_loss_total / len(train_loader.dataset)
-            avg_train_acc = train_acc_total / len(train_loader.dataset)
+            avg_train_loss = train_loss_total / max(len(train_loader.dataset), 1)
+            avg_train_acc = train_acc_total / max(len(train_loader.dataset), 1)
 
             # Validation
             self.model.eval()
@@ -300,12 +305,12 @@ class SimCLRExperimentTrainer:
                 ):
                     x1, x2 = x1.to(self.device), x2.to(self.device)
                     with self.precision.autocast():
-                        loss, acc = self.model.training_step(x1, x2)  # uses same loss
+                        loss, acc = self.model.training_step(x1, x2)
                     val_loss_total += loss.item() * x1.size(0)
                     val_acc_total += acc.item() * x1.size(0)
 
-            avg_val_loss = val_loss_total / len(val_loader.dataset)
-            avg_val_acc = val_acc_total / len(val_loader.dataset)
+            avg_val_loss = val_loss_total / max(len(val_loader.dataset), 1)
+            avg_val_acc = val_acc_total / max(len(val_loader.dataset), 1)
 
             if self.scheduler and step_frequency == "epoch":
                 self.scheduler.step(avg_val_loss)
@@ -331,9 +336,7 @@ class SimCLRExperimentTrainer:
 
             self.cb_runner.on_epoch_end(self, epoch, logs)
 
-        # Final evaluation (just using validation loss as metric)
         self.cb_runner.on_train_end(self)
-        # Return minimal metrics for the experiment CSV
         return {
             "val_loss": avg_val_loss,
             "val_contrastive_acc": avg_val_acc,
