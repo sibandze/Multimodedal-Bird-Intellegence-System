@@ -318,8 +318,8 @@ class SupervisedExperimentTrainer:
         print(f"    Val samples:   {len(val_loader.dataset)}")
         print(f"    Test samples:  {len(test_loader.dataset)}")
 
-        if compiled:
-            self.model = torch.compile(self.model)
+        # FIX 4: keep reference to raw model before compilation
+        self.raw_model = self.model
 
         criterion = nn.CrossEntropyLoss()
         self.optimizer = optim.AdamW(
@@ -342,7 +342,7 @@ class SupervisedExperimentTrainer:
         )
         step_frequency = get_scheduler_step_frequency(scheduler_type)
 
-        # Checkpoint Resumption
+        # Checkpoint Resumption (before compile)
         resume_epoch = 0
         checkpoint_path = self.run_dir / "checkpoint_last.pth"
         if checkpoint_path.exists():
@@ -353,6 +353,7 @@ class SupervisedExperimentTrainer:
                 checkpoint_path, map_location=self.device, weights_only=False
             )
 
+            # Load into raw model (uncompiled)
             self.model.load_state_dict(checkpoint["model_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if self.scheduler and checkpoint.get("scheduler_state_dict"):
@@ -370,6 +371,10 @@ class SupervisedExperimentTrainer:
 
             resume_epoch = checkpoint["epoch"]
             print(f"    ✓ Resumed successfully from epoch {resume_epoch + 1}")
+
+        # Compile AFTER loading checkpoint weights (if requested)
+        if compiled:
+            self.model = torch.compile(self.model)
 
         # Trigger Train Begin Callbacks
         self.cb_runner.on_train_begin(self)
@@ -446,60 +451,68 @@ class SupervisedExperimentTrainer:
             # VALIDATION PHASE  (once per epoch, outside batch loop)
             # ---------------------------------------------------
             self.cb_runner.on_validation_begin(self)
-            self.model.eval()
 
-            val_loss_total = 0.0
-            val_correct_window = 0
-            val_total_windows = 0
-
-            all_logits = []
-            all_labels = []
-            all_rec_ids = []
-
-            with torch.no_grad():
-                for val_batch_idx, (mel_segments, labels, recording_ids) in enumerate(
-                    tqdm(
-                        val_loader,
-                        desc=f"Epoch {epoch+1}/{epochs} [Val]",
-                        leave=False,
-                    )
-                ):
-                    mel_segments = mel_segments.to(self.device)
-                    labels = labels.to(self.device)
-
-                    with self.precision.autocast():
-                        logits = self.model(mel_segments)
-
-                    loss = criterion(logits, labels)
-                    val_loss_total += loss.item() * labels.size(0)
-                    preds = torch.argmax(logits, dim=1)
-                    val_correct_window += (preds == labels).sum().item()
-                    val_total_windows += labels.size(0)
-
-                    all_logits.append(logits.detach().cpu())
-                    all_labels.append(labels.cpu())
-                    all_rec_ids.extend(recording_ids)
-
-            # Aggregate to recording level
-            if val_total_windows > 0:
-                all_logits = torch.cat(all_logits, dim=0)
-                all_labels = torch.cat(all_labels, dim=0)
-
-                rec_ids, rec_targets, rec_logits = aggregate_recordings(
-                    all_logits, all_labels, all_rec_ids
-                )
-
-                rec_loss = criterion(
-                    rec_logits.to(self.device), rec_targets.to(self.device)
-                )
-                avg_val_loss = rec_loss.item()
-                rec_preds = rec_logits.argmax(dim=1).cpu()
-                val_acc = (rec_preds == rec_targets).float().mean().item()
-                val_window_acc = val_correct_window / val_total_windows
-            else:
+            # FIX 3: Guard against empty validation set
+            if len(val_loader) == 0:
+                print(f"  WARNING: Val dataset is empty, skipping validation.")
                 avg_val_loss = 0.0
                 val_acc = 0.0
                 val_window_acc = 0.0
+            else:
+                self.model.eval()
+
+                val_loss_total = 0.0
+                val_correct_window = 0
+                val_total_windows = 0
+
+                all_logits = []
+                all_labels = []
+                all_rec_ids = []
+
+                with torch.no_grad():
+                    for val_batch_idx, (mel_segments, labels, recording_ids) in enumerate(
+                        tqdm(
+                            val_loader,
+                            desc=f"Epoch {epoch+1}/{epochs} [Val]",
+                            leave=False,
+                        )
+                    ):
+                        mel_segments = mel_segments.to(self.device)
+                        labels = labels.to(self.device)
+
+                        with self.precision.autocast():
+                            logits = self.model(mel_segments)
+
+                        loss = criterion(logits, labels)
+                        val_loss_total += loss.item() * labels.size(0)
+                        preds = torch.argmax(logits, dim=1)
+                        val_correct_window += (preds == labels).sum().item()
+                        val_total_windows += labels.size(0)
+
+                        all_logits.append(logits.detach().cpu())
+                        all_labels.append(labels.cpu())
+                        all_rec_ids.extend(recording_ids)
+
+                # Aggregate to recording level
+                if val_total_windows > 0:
+                    all_logits = torch.cat(all_logits, dim=0)
+                    all_labels = torch.cat(all_labels, dim=0)
+
+                    rec_ids, rec_targets, rec_logits = aggregate_recordings(
+                        all_logits, all_labels, all_rec_ids
+                    )
+
+                    rec_loss = criterion(
+                        rec_logits.to(self.device), rec_targets.to(self.device)
+                    )
+                    avg_val_loss = rec_loss.item()
+                    rec_preds = rec_logits.argmax(dim=1).cpu()
+                    val_acc = (rec_preds == rec_targets).float().mean().item()
+                    val_window_acc = val_correct_window / val_total_windows
+                else:
+                    avg_val_loss = 0.0
+                    val_acc = 0.0
+                    val_window_acc = 0.0
 
             val_logs = {
                 "val_loss": avg_val_loss,
@@ -507,6 +520,11 @@ class SupervisedExperimentTrainer:
                 "val_window_acc": val_window_acc,
             }
             self.cb_runner.on_validation_end(self, val_logs)
+
+            # FIX 1: Track best metrics on trainer instance
+            if val_acc > self.best_val_acc:
+                self.best_val_acc = val_acc
+                self.best_epoch = epoch + 1
 
             # ---------------------------------------------------
             # SCHEDULER (epoch-level)
@@ -544,17 +562,49 @@ class SupervisedExperimentTrainer:
 
             self.cb_runner.on_epoch_end(self, epoch, logs)
 
+            # FIX 2: Save resumable checkpoint
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": self.raw_model.state_dict(),
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                    "scheduler_state_dict": (
+                        self.scheduler.state_dict() if self.scheduler else None
+                    ),
+                    "precision_state_dict": self.precision.state_dict(),
+                    "callbacks_state_dict": self.cb_runner.state_dict(),
+                    "torch_rng_state": torch.random.get_rng_state(),
+                    "cuda_rng_state": (
+                        torch.cuda.get_rng_state_all()
+                        if torch.cuda.is_available()
+                        else None
+                    ),
+                },
+                self.run_dir / "checkpoint_last.pth",
+            )
+
         # =========================================================
         # Final evaluation on TEST set using best checkpoint
         # =========================================================
-        best_ckpt_path = self.run_dir / "checkpoint_best.pth"
-        if not best_ckpt_path.exists():
-            print("WARNING: No best checkpoint found. Using current model weights.")
-            metrics = self._evaluate(self.model, test_loader, class_names)
+        # FIX 3: Handle empty test set
+        if len(test_loader) == 0:
+            print("WARNING: Test dataset is empty. Skipping final evaluation.")
+            metrics = {
+                "accuracy": 0.0,
+                "macro_f1": 0.0,
+                "weighted_f1": 0.0,
+                "warning": "empty_test_set",
+            }
         else:
-            best_ckpt = torch.load(best_ckpt_path, weights_only=False)
-            self.model.load_state_dict(best_ckpt["model_state_dict"])
-            metrics = self._evaluate(self.model, test_loader, class_names)
+            best_ckpt_path = self.run_dir / "checkpoint_best.pth"
+            if not best_ckpt_path.exists():
+                print("WARNING: No best checkpoint found. Using current model weights.")
+                metrics = self._evaluate(self.model, test_loader, class_names)
+            else:
+                best_ckpt = torch.load(best_ckpt_path, weights_only=False)
+                # FIX 4: Load into raw model for evaluation
+                self.raw_model.load_state_dict(best_ckpt["model_state_dict"])
+                metrics = self._evaluate(self.raw_model, test_loader, class_names)
 
         self.cb_runner.on_train_end(self)
         return metrics

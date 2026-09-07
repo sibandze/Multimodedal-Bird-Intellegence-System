@@ -209,7 +209,8 @@ class SimCLRExperimentTrainer:
         epochs = self.config["training"]["epochs"]
         scheduler_type = self.config["training"].get("scheduler_type", "cosine")
         warmup_steps = self.config["training"].get("warmup_steps", 0)
-        total_steps = len(train_loader) * epochs
+        # FIX 5: Make total_steps consistent with supervised trainer
+        total_steps = max(len(train_loader) * epochs, warmup_steps * 2)
         self.scheduler = create_scheduler(
             optimizer=self.optimizer,
             scheduler_type=scheduler_type,
@@ -235,7 +236,13 @@ class SimCLRExperimentTrainer:
                 self.precision.load_state_dict(checkpoint["precision_state_dict"])
             if "callbacks_state_dict" in checkpoint:
                 self.cb_runner.load_state_dict(checkpoint["callbacks_state_dict"])
+            # FIX 2: Restore RNG state on resume
+            if "torch_rng_state" in checkpoint:
+                torch.set_rng_state(checkpoint["torch_rng_state"])
+            if checkpoint.get("cuda_rng_state") and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
             resume_epoch = checkpoint["epoch"]
+            print(f"    ✓ Resumed successfully from epoch {resume_epoch + 1}")
 
         self.cb_runner.on_train_begin(self)
 
@@ -312,6 +319,11 @@ class SimCLRExperimentTrainer:
             avg_val_loss = val_loss_total / max(len(val_loader.dataset), 1)
             avg_val_acc = val_acc_total / max(len(val_loader.dataset), 1)
 
+            # FIX 1: Track best loss on trainer instance
+            if avg_val_loss < self.best_loss:
+                self.best_loss = avg_val_loss
+                self.best_epoch = epoch + 1
+
             if self.scheduler and step_frequency == "epoch":
                 self.scheduler.step(avg_val_loss)
 
@@ -335,6 +347,27 @@ class SimCLRExperimentTrainer:
             )
 
             self.cb_runner.on_epoch_end(self, epoch, logs)
+
+            # FIX 2: Save resumable checkpoint (complements CheckpointCallback's best-only save)
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": self.model.state_dict(),
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                    "scheduler_state_dict": (
+                        self.scheduler.state_dict() if self.scheduler else None
+                    ),
+                    "precision_state_dict": self.precision.state_dict(),
+                    "callbacks_state_dict": self.cb_runner.state_dict(),
+                    "torch_rng_state": torch.random.get_rng_state(),
+                    "cuda_rng_state": (
+                        torch.cuda.get_rng_state_all()
+                        if torch.cuda.is_available()
+                        else None
+                    ),
+                },
+                self.run_dir / "checkpoint_last.pth",
+            )
 
         self.cb_runner.on_train_end(self)
         return {
