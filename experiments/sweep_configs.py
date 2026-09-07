@@ -2,13 +2,26 @@
 """Hyperparameter sweep configurations for experiments."""
 
 from typing import List, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import itertools
 
 
 @dataclass
 class HyperparameterSweep:
-    """Defines a sweep over hyperparameter space."""
+    """
+    Defines a sweep over hyperparameter space.
+
+    Each key in `params` should be a dotted config path matching the
+    experiment runner's config structure. For example:
+        "training.learning_rate"
+        "training.temperature"
+        "training.mixed_precision.enabled"
+        "model.embed_dim"
+        "projection.hidden_dim"
+
+    This lets the sweep system apply values directly via set_nested_config()
+    without a separate mapping dict.
+    """
 
     name: str
     params: Dict[str, List[Any]]
@@ -16,8 +29,8 @@ class HyperparameterSweep:
 
     def generate_configs(self) -> List[Dict[str, Any]]:
         """Generate all combinations of hyperparameters."""
-        keys = self.params.keys()
-        values = self.params.values()
+        keys = list(self.params.keys())
+        values = list(self.params.values())
         configs = []
         for combo in itertools.product(*values):
             configs.append(dict(zip(keys, combo)))
@@ -30,7 +43,7 @@ BASELINE_LEARNING_RATE_SWEEP = HyperparameterSweep(
     name="baseline_lr_sweep",
     description="Sweep over learning rates for baseline model",
     params={
-        "learning_rate": [1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
+        "training.learning_rate": [1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
     },
 )
 
@@ -38,7 +51,7 @@ BASELINE_BATCH_SIZE_SWEEP = HyperparameterSweep(
     name="baseline_batch_sweep",
     description="Sweep over batch sizes for baseline model",
     params={
-        "batch_size": [16, 32, 64],
+        "training.batch_size": [16, 32, 64],
     },
 )
 
@@ -46,9 +59,9 @@ BASELINE_ARCHITECTURE_SWEEP = HyperparameterSweep(
     name="baseline_arch_sweep",
     description="Sweep over model architecture parameters",
     params={
-        "embed_dim": [128, 256, 512],
-        "num_layers": [3, 6, 12],
-        "heads": [4, 8, 16],
+        "model.embed_dim": [128, 256, 512],
+        "model.num_layers": [3, 6, 12],
+        "model.heads": [4, 8, 16],
     },
 )
 
@@ -56,7 +69,7 @@ BASELINE_DROPOUT_SWEEP = HyperparameterSweep(
     name="baseline_dropout_sweep",
     description="Sweep over dropout rates for regularization",
     params={
-        "dropout": [0.0, 0.1, 0.2, 0.3],
+        "model.dropout": [0.0, 0.1, 0.2, 0.3],
     },
 )
 
@@ -64,9 +77,9 @@ BASELINE_AUGMENTATION_SWEEP = HyperparameterSweep(
     name="baseline_augmentation_sweep",
     description="Sweep over SpecAugment configurations",
     params={
-        "spec_aug_prob": [0.0, 0.3, 0.5, 0.7],
-        "freq_mask_param": [3, 6, 10],
-        "time_mask_param": [5, 10, 20],
+        "augmentation.prob": [0.0, 0.3, 0.5, 0.7],
+        "augmentation.freq_mask_param": [3, 6, 10],
+        "augmentation.time_mask_param": [5, 10, 20],
     },
 )
 
@@ -76,8 +89,8 @@ FOCUSED_LR_MOMENTUM_SWEEP = HyperparameterSweep(
     name="focused_lr_momentum",
     description="Fine-tune learning rate with momentum/weight decay",
     params={
-        "learning_rate": [1e-4, 3e-4, 5e-4],
-        "weight_decay": [0.0, 1e-5, 1e-4],
+        "training.learning_rate": [1e-4, 3e-4, 5e-4],
+        "training.weight_decay": [0.0, 1e-5, 1e-4],
     },
 )
 
@@ -85,14 +98,14 @@ WARMUP_SCHEDULER_SWEEP = HyperparameterSweep(
     name="warmup_scheduler",
     description="Compare different warmup and scheduling strategies",
     params={
-        "scheduler_type": [
+        "training.scheduler_type": [
             "constant",
             "cosine",
             "linear_decay",
             "reduce_on_plateau",
             "cosine_warm_restarts",
         ],
-        "warmup_steps": [0, 500, 1000],
+        "training.warmup_steps": [0, 500, 1000],
     },
 )
 
@@ -100,9 +113,9 @@ SCHEDULER_FINETUNE_SWEEP = HyperparameterSweep(
     name="scheduler_finetune",
     description="Fine-tune cosine scheduler parameters",
     params={
-        "scheduler_type": ["cosine"],
-        "warmup_steps": [250, 500, 1000, 2000],
-        "min_lr": [1e-6, 1e-5, 1e-4],
+        "training.scheduler_type": ["cosine"],
+        "training.warmup_steps": [250, 500, 1000, 2000],
+        "training.min_lr": [1e-6, 1e-5, 1e-4],
     },
 )
 
@@ -110,8 +123,8 @@ MIXED_PRECISION_SWEEP = HyperparameterSweep(
     name="mixed_precision_test",
     description="Test impact of mixed precision training",
     params={
-        "use_mixed_precision": [False, True],
-        "learning_rate": [1e-4, 5e-4],
+        "training.mixed_precision.enabled": [False, True],
+        "training.learning_rate": [1e-4, 5e-4],
     },
 )
 
@@ -121,7 +134,7 @@ SSL_LEARNING_RATE_SWEEP = HyperparameterSweep(
     name="ssl_lr_sweep",
     description="Sweep over learning rates for SimCLR pretraining",
     params={
-        "learning_rate": [1e-4, 3e-4, 5e-4, 1e-3],
+        "training.learning_rate": [1e-4, 3e-4, 5e-4, 1e-3],
     },
 )
 
@@ -129,7 +142,7 @@ SSL_TEMPERATURE_SWEEP = HyperparameterSweep(
     name="ssl_temperature_sweep",
     description="Sweep over contrastive temperature values",
     params={
-        "temperature": [0.03, 0.05, 0.07, 0.1, 0.2],
+        "training.temperature": [0.03, 0.05, 0.07, 0.1, 0.2],
     },
 )
 
@@ -137,8 +150,8 @@ SSL_PROJECTION_SWEEP = HyperparameterSweep(
     name="ssl_projection_sweep",
     description="Sweep over projection head dimensions",
     params={
-        "projection_hidden_dim": [128, 256, 512],
-        "projection_output_dim": [64, 128, 256],
+        "projection.hidden_dim": [128, 256, 512],
+        "projection.output_dim": [64, 128, 256],
     },
 )
 
@@ -146,7 +159,7 @@ SSL_BATCH_SIZE_SWEEP = HyperparameterSweep(
     name="ssl_batch_sweep",
     description="Sweep over batch sizes for SSL (larger = more negatives = better)",
     params={
-        "batch_size": [16, 32, 64, 128],
+        "training.batch_size": [16, 32, 64, 128],
     },
 )
 
@@ -154,9 +167,9 @@ SSL_AUGMENTATION_SWEEP = HyperparameterSweep(
     name="ssl_augmentation_sweep",
     description="Sweep over augmentation strength for SSL views",
     params={
-        "spec_aug_prob": [0.3, 0.5, 0.7, 0.9],
-        "freq_mask_param": [4, 6, 10],
-        "time_mask_param": [5, 10, 20],
+        "augmentation.prob": [0.3, 0.5, 0.7, 0.9],
+        "augmentation.freq_mask_param": [4, 6, 10],
+        "augmentation.time_mask_param": [5, 10, 20],
     },
 )
 
@@ -164,7 +177,7 @@ SSL_WEIGHT_DECAY_SWEEP = HyperparameterSweep(
     name="ssl_weight_decay_sweep",
     description="Sweep over weight decay for SSL pretraining",
     params={
-        "weight_decay": [0.0, 1e-6, 1e-5, 1e-4, 1e-3],
+        "training.weight_decay": [0.0, 1e-6, 1e-5, 1e-4, 1e-3],
     },
 )
 
@@ -172,9 +185,9 @@ SSL_QUICK_SANITY = HyperparameterSweep(
     name="ssl_quick_sanity",
     description="Quick sanity check: minimal config to verify SSL pipeline works",
     params={
-        "learning_rate": [3e-4],
-        "batch_size": [16],
-        "temperature": [0.07],
+        "training.learning_rate": [3e-4],
+        "training.batch_size": [16],
+        "training.temperature": [0.07],
     },
 )
 

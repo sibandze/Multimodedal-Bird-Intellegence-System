@@ -20,11 +20,14 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.utils.configs import resolve_metadata_csv_path
+from src.utils.configs import (
+    load_and_resolve_config,
+    resolve_metadata_csv_path,
+    set_nested_config,
+)
 from experiments.sweep_configs import SWEEP_SUITES
 from src.training.supervised_experiment_train import SupervisedExperimentTrainer
 from src.training.ssl_simclr_train import SimCLRExperimentTrainer
-from src.utils.configs import load_and_resolve_config
 
 
 # Which suites are SSL vs supervised (by naming convention)
@@ -57,6 +60,9 @@ class ExperimentManager:
         self.results_dir.mkdir(exist_ok=True, parents=True)
         self.mode = mode
 
+        # Initialize seed attribute before set_seed() or load_data() are called
+        self.seed = 42
+
         # Load base config
         config_rel_path = (
             str(self.base_config_path.relative_to(self.ROOT_DIR))
@@ -81,7 +87,7 @@ class ExperimentManager:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-    def load_data(self):    
+    def load_data(self):
         """Load and distill dataset to num_classes and num_samples_per_class."""
         if self.df is None:
             csv_path = resolve_metadata_csv_path(self.base_config)
@@ -91,17 +97,17 @@ class ExperimentManager:
                     f"Run data pipeline first: python main.py --pipeline"
                 )
             full_df = pd.read_csv(csv_path)
-            print(f"✓ Loaded {len(full_df)} samples from {csv_path}")           
-            
-            # ---- Distillation ----            
+            print(f"✓ Loaded {len(full_df)} samples from {csv_path}")
+
+            # ---- Distillation ----
             data_cfg = self.base_config.get('data', {})
             num_classes = data_cfg.get('num_classes')
             num_samples_per_class = data_cfg.get('num_samples_per_class')
             label_col = data_cfg.get('label_column')
-            
+
             if num_classes and num_samples_per_class:
                 print(f"🔬 Distilling dataset to {num_classes} classes x {num_samples_per_class} samples each")
-                
+
                 # Group by label
                 grouped = full_df.groupby(label_col)
                 class_counts = grouped.size().sort_values(ascending=False)
@@ -119,7 +125,7 @@ class ExperimentManager:
 
                 # Sample per class
                 sampled_dfs = []
-                rng = np.random.RandomState(self.seed)   # ensure reproducibility
+                rng = np.random.RandomState(self.seed)
                 for cls in selected_classes:
                     cls_df = full_df[full_df[label_col] == cls]
                     sampled = cls_df.sample(n=num_samples_per_class, random_state=rng)
@@ -143,7 +149,8 @@ class ExperimentManager:
         return self.mode
 
     def create_experiment_run(
-        self, sweep_name: str, run_index: int, hyperparams: Dict[str, Any]
+        self, sweep_name: str, run_index: int, hyperparams: Dict[str, Any],
+        run_seed: int,
     ) -> tuple:
         """Create a unique directory and config for this experiment run."""
         if not self.experiment_dir:
@@ -157,7 +164,9 @@ class ExperimentManager:
         run_dir = self.experiment_dir / run_name
         run_dir.mkdir(exist_ok=True, parents=True)
 
-        run_config = self._merge_config_with_hyperparams(hyperparams, run_dir, run_name)
+        run_config = self._merge_config_with_hyperparams(
+            hyperparams, run_dir, run_name, run_seed
+        )
 
         config_path = run_dir / "config.yaml"
         with open(config_path, "w") as f:
@@ -166,43 +175,28 @@ class ExperimentManager:
         return run_dir, run_config
 
     def _merge_config_with_hyperparams(
-        self, hyperparams: Dict[str, Any], run_dir: Path, run_name: str
+        self, hyperparams: Dict[str, Any], run_dir: Path, run_name: str,
+        run_seed: int,
     ) -> Dict:
-        """Merge base config with hyperparameter overrides."""
+        """
+        Merge base config with hyperparameter overrides.
+
+        Sweep params use dotted paths (e.g. "training.learning_rate") which
+        are applied directly via set_nested_config(). No mapping dict needed.
+        """
         config = yaml.safe_load(yaml.dump(self.base_config))  # Deep copy
 
         # Ensure sections exist
-        for section in ("training", "model", "augmentation", "logging", "projection"):
+        for section in ("training", "model", "augmentation", "logging", "projection", "experiment"):
             if section not in config:
                 config[section] = {}
 
-        # Common param mapping (supervised + SSL share most of these)
-        param_mapping = {
-            "learning_rate": ("training", "learning_rate"),
-            "batch_size": ("training", "batch_size"),
-            "embed_dim": ("model", "embed_dim"),
-            "num_layers": ("model", "num_layers"),
-            "heads": ("model", "heads"),
-            "dropout": ("model", "dropout"),
-            "weight_decay": ("training", "weight_decay"),
-            "warmup_steps": ("training", "warmup_steps"),
-            "scheduler_type": ("training", "scheduler_type"),
-            "use_mixed_precision": ("training", "use_mixed_precision"),
-            "spec_aug_prob": ("augmentation", "prob"),
-            "freq_mask_param": ("augmentation", "freq_mask_param"),
-            "time_mask_param": ("augmentation", "time_mask_param"),
-            # SSL-specific
-            "temperature": ("training", "temperature"),
-            "projection_hidden_dim": ("projection", "hidden_dim"),
-            "projection_output_dim": ("projection", "output_dim"),
-        }
+        # Apply sweep hyperparameters via dotted-path keys
+        for dotted_path, param_value in hyperparams.items():
+            set_nested_config(config, dotted_path, param_value)
 
-        for param_name, param_value in hyperparams.items():
-            if param_name in param_mapping:
-                section, key = param_mapping[param_name]
-                if section not in config:
-                    config[section] = {}
-                config[section][key] = param_value
+        # Per-run seed for reproducible, distinct runs
+        config["experiment"]["seed"] = run_seed
 
         # Configure logging
         config["logging"]["wandb_run_name"] = run_name
@@ -211,13 +205,11 @@ class ExperimentManager:
             config["logging"]["wandb_project"] = "bird-song-classifier"
 
         # Experiment metadata
-        config["experiment"] = {
-            "name": run_name,
-            "experiment_group": self.experiment_name,
-            "run_dir": str(run_dir),
-            "timestamp": datetime.now().isoformat(),
-            "hyperparams": hyperparams,
-        }
+        config["experiment"]["name"] = run_name
+        config["experiment"]["experiment_group"] = self.experiment_name
+        config["experiment"]["run_dir"] = str(run_dir)
+        config["experiment"]["timestamp"] = datetime.now().isoformat()
+        config["experiment"]["hyperparams"] = hyperparams
 
         return config
 
@@ -268,8 +260,12 @@ class ExperimentManager:
         dry_run: bool = False,
     ):
         """Run a single training experiment."""
+        # FIX: Per-run seed so each experiment has deterministic but distinct randomness
+        run_seed = self.seed + run_index
+        self.set_seed(run_seed)
+
         run_dir, run_config = self.create_experiment_run(
-            sweep_name, run_index, hyperparams
+            sweep_name, run_index, hyperparams, run_seed
         )
 
         mode = self._resolve_mode(sweep_name)
@@ -278,6 +274,7 @@ class ExperimentManager:
             print(
                 f"  [{run_index}] [DRY RUN] [{mode}] Would train with: {hyperparams}"
             )
+            print(f"      Seed: {run_seed}")
             print(f"      Config: {run_dir}/config.yaml")
             return None
 
@@ -288,6 +285,7 @@ class ExperimentManager:
                 trainer = SupervisedExperimentTrainer(run_config, run_dir)
 
             print(f"\n  [{run_index}] [{mode}] Training: {hyperparams}")
+            print(f"      Seed: {run_seed}")
             metrics = trainer.train(self.df)
 
             self.log_run_result(run_index, sweep_name, hyperparams, metrics)
@@ -311,14 +309,14 @@ class ExperimentManager:
             print(f"      ✗ Error during training: {str(e)}\n{tb}")
 
             if mode == "ssl":
-                metrics = {
+                error_metrics = {
                     "val_loss": float("inf"),
                     "val_contrastive_acc": 0.0,
                     "error": str(e),
                     "error_traceback": tb,
                 }
             else:
-                metrics = {
+                error_metrics = {
                     "accuracy": 0.0,
                     "macro_f1": 0.0,
                     "weighted_f1": 0.0,
@@ -326,7 +324,7 @@ class ExperimentManager:
                     "error_traceback": tb,
                 }
 
-            self.log_run_result(run_index, sweep_name, hyperparams, metrics)
+            self.log_run_result(run_index, sweep_name, hyperparams, error_metrics)
             return None
 
     def save_experiment_summary(self, mode: str = "supervised"):
@@ -339,6 +337,7 @@ class ExperimentManager:
             f"**Mode:** {mode}\n"
             f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"**Total Runs:** {self.run_counter}\n"
+            f"**Base Seed:** {self.seed}\n"
             f"\n"
             f"## Results Location\n"
             f"- Detailed results: `{self.results_csv}`\n"
@@ -353,10 +352,9 @@ class ExperimentManager:
                 if mode == "ssl":
                     sort_col = "val_loss"
                     ascending = True
-                    metric_cols = ["val_loss", "val_contrastive_acc", "train_loss"]
                     summary += "### Top 5 Runs by Val Loss (lowest first)\n\n"
-                    summary += "| Run ID | Val Loss | Contrastive Acc | LR | Batch Size |\n"
-                    summary += "|--------|----------|-----------------|-----|------------|\n"
+                    summary += "| Run ID | Val Loss | Contrastive Acc | LR | Batch Size | Seed |\n"
+                    summary += "|--------|----------|-----------------|-----|------------|------|\n"
 
                     df_sorted = df_results.sort_values(sort_col, ascending=ascending)
                     for _, row in df_sorted.head(5).iterrows():
@@ -364,18 +362,19 @@ class ExperimentManager:
                             f"| {int(row['run_id'])} "
                             f"| {row.get('val_loss', 0):.4f} "
                             f"| {row.get('val_contrastive_acc', 0):.4f} "
-                            f"| {row.get('learning_rate', 'N/A')} "
-                            f"| {row.get('batch_size', 'N/A')} |\n"
+                            f"| {row.get('training.learning_rate', 'N/A')} "
+                            f"| {row.get('training.batch_size', 'N/A')} "
+                            f"| {row.get('experiment.seed', 'N/A')} |\n"
                         )
                 else:
                     sort_col = "accuracy"
                     ascending = False
                     summary += "### Top 5 Runs by Accuracy\n\n"
                     summary += (
-                        "| Run ID | Accuracy | Macro F1 | Learning Rate | Batch Size |\n"
+                        "| Run ID | Accuracy | Macro F1 | Learning Rate | Batch Size | Seed |\n"
                     )
                     summary += (
-                        "|--------|----------|----------|---------------|------------|\n"
+                        "|--------|----------|----------|---------------|------------|------|\n"
                     )
 
                     df_sorted = df_results.sort_values(sort_col, ascending=ascending)
@@ -384,8 +383,9 @@ class ExperimentManager:
                             f"| {int(row['run_id'])} "
                             f"| {row.get('accuracy', 0):.4f} "
                             f"| {row.get('macro_f1', 0):.4f} "
-                            f"| {row.get('learning_rate', 'N/A')} "
-                            f"| {row.get('batch_size', 'N/A')} |\n"
+                            f"| {row.get('training.learning_rate', 'N/A')} "
+                            f"| {row.get('training.batch_size', 'N/A')} "
+                            f"| {row.get('experiment.seed', 'N/A')} |\n"
                         )
 
             except Exception as e:
@@ -398,13 +398,14 @@ class ExperimentManager:
             f"1. Review `results.csv` for aggregate metrics across all runs\n"
             f"2. Inspect individual `run_XXXX_*/` directories for:\n"
             f"   - `config.yaml` - exact hyperparameters used\n"
-            f"   - `best_model.pth` - trained model checkpoint\n"
+            f"   - `label_mappings.json` - class name to index mapping\n"
+            f"   - `checkpoint_best.pth` - trained model checkpoint\n"
             f"   - `training_metrics.json` - epoch-by-epoch training logs\n"
         )
 
         if mode == "ssl":
             summary += (
-                f"   - `best_model.pth` - encoder-only weights (projection head excluded)\n"
+                f"   - `checkpoint_best.pth` - encoder-only weights (projection head excluded)\n"
                 f"\n"
                 f"## Next Steps\n"
                 f"\n"
@@ -484,6 +485,7 @@ def main():
     print(f"\n{'='*80}")
     print(f"🚀 Running Experiment Suite: {args.suite}")
     print(f"   Mode: {effective_mode}")
+    print(f"   Base Seed: {args.seed}")
     print(f"{'='*80}\n")
 
     total_runs = sum(len(sweep.generate_configs()) for sweep in sweep_suite)
