@@ -7,6 +7,46 @@ import yaml
 from pathlib import Path
 
 
+def get_nested_config(config: dict, dotted_path: str, default=None):
+    """
+    Retrieve a value from a nested dict using a dotted path.
+
+    Args:
+        config: Root config dict
+        dotted_path: Dot-separated key path, e.g. "training.mixed_precision.enabled"
+        default: Value to return if path doesn't exist
+
+    Returns:
+        The value at the path, or default if not found.
+    """
+    keys = dotted_path.split(".")
+    d = config
+    for key in keys:
+        if not isinstance(d, dict) or key not in d:
+            return default
+        d = d[key]
+    return d
+
+
+def set_nested_config(config: dict, dotted_path: str, value):
+    """
+    Set a value in a nested dict using a dotted path.
+    Creates intermediate dicts as needed.
+
+    Args:
+        config: Root config dict (modified in place)
+        dotted_path: Dot-separated key path, e.g. "training.mixed_precision.enabled"
+        value: Value to set
+    """
+    keys = dotted_path.split(".")
+    d = config
+    for key in keys[:-1]:
+        if key not in d or not isinstance(d[key], dict):
+            d[key] = {}
+        d = d[key]
+    d[keys[-1]] = value
+
+
 def load_and_resolve_config(root_dir: str | Path, config_rel_path: str) -> dict:
     """
     Loads YAML from root_dir / config_rel_path, resolves all data paths to absolute,
