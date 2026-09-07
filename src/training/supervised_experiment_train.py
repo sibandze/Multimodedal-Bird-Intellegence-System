@@ -1,10 +1,12 @@
 # src/training/supervised_experiment_train.py
 
+import json
 import subprocess
 import time
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 from collections import defaultdict
+import random
 
 import numpy as np
 import pandas as pd
@@ -30,6 +32,7 @@ from src.training.callbacks import (
     CSVLoggerCallback,
     WandBLoggerCallback,
     PlotMetricsCallback,
+    _unwrap_compile,
 )
 
 
@@ -59,7 +62,6 @@ def aggregate_recordings(logits_all, labels_all, recording_ids_all):
         rec_targets: tensor of true labels [num_recordings]
         rec_logits: tensor of averaged logits [num_recordings, num_classes]
     """
-    # Group window indices by recording ID
     groups = defaultdict(list)
     for i, rec_id in enumerate(recording_ids_all):
         groups[str(rec_id)].append(i)
@@ -110,7 +112,6 @@ class SupervisedExperimentTrainer:
 
         if callbacks is None:
             callbacks = [
-                CheckpointCallback(self.run_dir, monitor="val_acc", mode="max"),
                 EarlyStoppingCallback(
                     monitor="val_acc",
                     mode="max",
@@ -119,6 +120,7 @@ class SupervisedExperimentTrainer:
                 JSONLoggerCallback(self.run_dir),
                 CSVLoggerCallback(self.run_dir),
                 PlotMetricsCallback(self.run_dir),
+                CheckpointCallback(self.run_dir, monitor="val_acc", mode="max"),
                 WandBLoggerCallback(config, self.run_dir),
             ]
         self.cb_runner = CallbackRunner(callbacks)
@@ -140,7 +142,6 @@ class SupervisedExperimentTrainer:
         segment_size = self.config["audio"]["segment_size"]
         window_config = self.config["window"]
 
-        # Use experiment seed if available
         seed = self.config.get("experiment", {}).get("seed", 42)
 
         test_size = self.config["training"].get("test_size", 0.15)
@@ -162,7 +163,6 @@ class SupervisedExperimentTrainer:
         eval_df = df[df["scientific_name_id"].isin(eval_classes)].copy()
         rare_df = df[df["scientific_name_id"].isin(rare_classes)].copy()
 
-        # Guard: if all classes are rare, fall back to train-only with no eval splits
         if len(eval_df) == 0:
             print(
                 f"WARNING: All {len(rare_classes)} classes have fewer than "
@@ -170,7 +170,7 @@ class SupervisedExperimentTrainer:
                 f"Training without validation/test split."
             )
             train_df = rare_df.copy()
-            val_df = rare_df.iloc[:0].copy()   # empty, same columns
+            val_df = rare_df.iloc[:0].copy()
             test_df = rare_df.iloc[:0].copy()
         else:
             train_df, temp_df = train_test_split(
@@ -187,7 +187,6 @@ class SupervisedExperimentTrainer:
                 stratify=temp_df["scientific_name_id"],
             )
 
-            # Keep all rare recordings for training
             train_df = pd.concat([train_df, rare_df], ignore_index=True)
 
         train_dataset = SupervisedBirdSongDataset(
@@ -200,33 +199,37 @@ class SupervisedExperimentTrainer:
             window_config=window_config,
         )
 
-        val_dataset = SupervisedBirdSongDataset(
-            df=val_df,
-            segment_size=segment_size,
-            train=False,
-            label_to_idx=train_dataset.label_to_idx,
-            min_db=self.config["audio"]["min_db"],
-            max_db=self.config["audio"]["max_db"],
-            window_config={
-                "strategy": "sliding",
-                "stride": segment_size,
-            },
-            return_recording_id=True,
-        )
+        val_dataset = None
+        if len(val_df) > 0:
+            val_dataset = SupervisedBirdSongDataset(
+                df=val_df,
+                segment_size=segment_size,
+                train=False,
+                label_to_idx=train_dataset.label_to_idx,
+                min_db=self.config["audio"]["min_db"],
+                max_db=self.config["audio"]["max_db"],
+                window_config={
+                    "strategy": "sliding",
+                    "stride": segment_size,
+                },
+                return_recording_id=True,
+            )
 
-        test_dataset = SupervisedBirdSongDataset(
-            df=test_df,
-            segment_size=segment_size,
-            train=False,
-            label_to_idx=train_dataset.label_to_idx,
-            min_db=self.config["audio"]["min_db"],
-            max_db=self.config["audio"]["max_db"],
-            window_config={
-                "strategy": "sliding",
-                "stride": segment_size,
-            },
-            return_recording_id=True,
-        )
+        test_dataset = None
+        if len(test_df) > 0:
+            test_dataset = SupervisedBirdSongDataset(
+                df=test_df,
+                segment_size=segment_size,
+                train=False,
+                label_to_idx=train_dataset.label_to_idx,
+                min_db=self.config["audio"]["min_db"],
+                max_db=self.config["audio"]["max_db"],
+                window_config={
+                    "strategy": "sliding",
+                    "stride": segment_size,
+                },
+                return_recording_id=True,
+            )
 
         train_loader = DataLoader(
             train_dataset,
@@ -236,24 +239,30 @@ class SupervisedExperimentTrainer:
             pin_memory=(self.device.type == "cuda"),
             persistent_workers=num_workers > 0,
         )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=(self.device.type == "cuda"),
-            persistent_workers=num_workers > 0,
-            collate_fn=supervised_val_collate_fn,
-        )
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=(self.device.type == "cuda"),
-            persistent_workers=num_workers > 0,
-            collate_fn=supervised_val_collate_fn,
-        )
+
+        val_loader = None
+        if val_dataset is not None and len(val_dataset) > 0:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=(self.device.type == "cuda"),
+                persistent_workers=num_workers > 0,
+                collate_fn=supervised_val_collate_fn,
+            )
+
+        test_loader = None
+        if test_dataset is not None and len(test_dataset) > 0:
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=(self.device.type == "cuda"),
+                persistent_workers=num_workers > 0,
+                collate_fn=supervised_val_collate_fn,
+            )
 
         return (
             train_loader,
@@ -282,8 +291,6 @@ class SupervisedExperimentTrainer:
         )
         class_names = [idx_to_label[i] for i in range(len(idx_to_label))]
 
-        # Save label mappings alongside the run for reproducibility
-        import json
         label_map_path = self.run_dir / "label_mappings.json"
         label_map_path.write_text(
             json.dumps(
@@ -294,14 +301,12 @@ class SupervisedExperimentTrainer:
 
         segment_size = self.config["audio"]["segment_size"]
 
-        # Initialize Model
         self.model = SupervisedTransformer(
             config=self.config,
             device=str(self.device),
             num_classes=len(class_names),
         ).to(self.device)
 
-        # Print Model and Environment Summary
         num_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(
             p.numel() for p in self.model.parameters() if p.requires_grad
@@ -315,11 +320,8 @@ class SupervisedExperimentTrainer:
         print(f"    Params:    {num_params:,} (Trainable: {trainable_params:,})")
         print(f"    Classes:   {len(class_names)}")
         print(f"    Train samples: {len(train_loader.dataset)}")
-        print(f"    Val samples:   {len(val_loader.dataset)}")
-        print(f"    Test samples:  {len(test_loader.dataset)}")
-
-        # FIX 4: keep reference to raw model before compilation
-        self.raw_model = self.model
+        print(f"    Val samples:   {len(val_loader.dataset) if val_loader else 0}")
+        print(f"    Test samples:  {len(test_loader.dataset) if test_loader else 0}")
 
         criterion = nn.CrossEntropyLoss()
         self.optimizer = optim.AdamW(
@@ -342,7 +344,7 @@ class SupervisedExperimentTrainer:
         )
         step_frequency = get_scheduler_step_frequency(scheduler_type)
 
-        # Checkpoint Resumption (before compile)
+        # Resumption — load into uncompiled model, then compile
         resume_epoch = 0
         checkpoint_path = self.run_dir / "checkpoint_last.pth"
         if checkpoint_path.exists():
@@ -353,30 +355,38 @@ class SupervisedExperimentTrainer:
                 checkpoint_path, map_location=self.device, weights_only=False
             )
 
-            # Load into raw model (uncompiled)
             self.model.load_state_dict(checkpoint["model_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if self.scheduler and checkpoint.get("scheduler_state_dict"):
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             if checkpoint.get("precision_state_dict"):
                 self.precision.load_state_dict(checkpoint["precision_state_dict"])
-
             if "callbacks_state_dict" in checkpoint:
                 self.cb_runner.load_state_dict(checkpoint["callbacks_state_dict"])
-
             if "torch_rng_state" in checkpoint:
                 torch.set_rng_state(checkpoint["torch_rng_state"])
             if checkpoint.get("cuda_rng_state") and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+            if checkpoint.get("python_rng_state") is not None:
+                random.setstate(checkpoint["python_rng_state"])
 
+            checkpoint_logs = checkpoint.get("logs", {})
+
+            self.best_val_acc = checkpoint_logs.get(
+                "best_val_acc",
+                self.best_val_acc,
+            )
+            self.best_epoch = checkpoint_logs.get(
+                "best_epoch",
+                self.best_epoch,
+            )
             resume_epoch = checkpoint["epoch"]
             print(f"    ✓ Resumed successfully from epoch {resume_epoch + 1}")
 
-        # Compile AFTER loading checkpoint weights (if requested)
+        # Compile AFTER loading checkpoint weights
         if compiled:
             self.model = torch.compile(self.model)
 
-        # Trigger Train Begin Callbacks
         self.cb_runner.on_train_begin(self)
 
         # =========================================================
@@ -448,17 +458,14 @@ class SupervisedExperimentTrainer:
                 self.cb_runner.on_batch_end(self, batch_idx, batch_end_logs)
 
             # ---------------------------------------------------
-            # VALIDATION PHASE  (once per epoch, outside batch loop)
+            # VALIDATION PHASE (once per epoch, outside batch loop)
             # ---------------------------------------------------
-            self.cb_runner.on_validation_begin(self)
+            avg_val_loss = 0.0
+            val_acc = 0.0
+            val_window_acc = 0.0
 
-            # FIX 3: Guard against empty validation set
-            if len(val_loader) == 0:
-                print(f"  WARNING: Val dataset is empty, skipping validation.")
-                avg_val_loss = 0.0
-                val_acc = 0.0
-                val_window_acc = 0.0
-            else:
+            if val_loader is not None and len(val_loader.dataset) > 0:
+                self.cb_runner.on_validation_begin(self)
                 self.model.eval()
 
                 val_loss_total = 0.0
@@ -493,7 +500,6 @@ class SupervisedExperimentTrainer:
                         all_labels.append(labels.cpu())
                         all_rec_ids.extend(recording_ids)
 
-                # Aggregate to recording level
                 if val_total_windows > 0:
                     all_logits = torch.cat(all_logits, dim=0)
                     all_labels = torch.cat(all_labels, dim=0)
@@ -509,19 +515,15 @@ class SupervisedExperimentTrainer:
                     rec_preds = rec_logits.argmax(dim=1).cpu()
                     val_acc = (rec_preds == rec_targets).float().mean().item()
                     val_window_acc = val_correct_window / val_total_windows
-                else:
-                    avg_val_loss = 0.0
-                    val_acc = 0.0
-                    val_window_acc = 0.0
 
-            val_logs = {
-                "val_loss": avg_val_loss,
-                "val_acc": val_acc,
-                "val_window_acc": val_window_acc,
-            }
-            self.cb_runner.on_validation_end(self, val_logs)
+                val_logs = {
+                    "val_loss": avg_val_loss,
+                    "val_acc": val_acc,
+                    "val_window_acc": val_window_acc,
+                }
+                self.cb_runner.on_validation_end(self, val_logs)
 
-            # FIX 1: Track best metrics on trainer instance
+            # Update trainer-level best tracking
             if val_acc > self.best_val_acc:
                 self.best_val_acc = val_acc
                 self.best_epoch = epoch + 1
@@ -551,44 +553,31 @@ class SupervisedExperimentTrainer:
                 "grad_norm": epoch_grad_norm / max(num_batches, 1),
                 "epoch_time_sec": epoch_duration,
                 "samples_per_sec": train_total / max(epoch_duration, 1e-9),
+                "best_val_acc": self.best_val_acc,
+                "best_epoch": self.best_epoch,
             }
             logs.update(get_gpu_memory_info(self.device))
 
             print(
                 f"Epoch {epoch+1}/{epochs} | {epoch_duration:.1f}s | "
-                f"Train Loss: {logs['train_loss']:.4f} | Train Acc: {logs['train_acc']:.4f} | "
-                f"Val Loss: {logs['val_loss']:.4f} | Val Acc: {logs['val_acc']:.4f}"
+                f"Train Loss: {logs['train_loss']:.4f} | "
+                f"Train Acc: {logs['train_acc']:.4f} | "
+                f"Val Loss: {logs['val_loss']:.4f} | "
+                f"Val Acc: {logs['val_acc']:.4f} | "
+                f"Best: {self.best_val_acc:.4f} (ep {self.best_epoch})"
             )
 
+            # CheckpointCallback handles all saving:
+            #   checkpoint_last.pth  (every epoch, full model for resumption)
+            #   checkpoint_best.pth  (on improvement, full model for resumption)
+            #   best_model.pth       (on improvement, full model weights for eval)
             self.cb_runner.on_epoch_end(self, epoch, logs)
-
-            # FIX 2: Save resumable checkpoint
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": self.raw_model.state_dict(),
-                    "optimizer_state_dict": self.optimizer.state_dict(),
-                    "scheduler_state_dict": (
-                        self.scheduler.state_dict() if self.scheduler else None
-                    ),
-                    "precision_state_dict": self.precision.state_dict(),
-                    "callbacks_state_dict": self.cb_runner.state_dict(),
-                    "torch_rng_state": torch.random.get_rng_state(),
-                    "cuda_rng_state": (
-                        torch.cuda.get_rng_state_all()
-                        if torch.cuda.is_available()
-                        else None
-                    ),
-                },
-                self.run_dir / "checkpoint_last.pth",
-            )
 
         # =========================================================
         # Final evaluation on TEST set using best checkpoint
         # =========================================================
-        # FIX 3: Handle empty test set
-        if len(test_loader) == 0:
-            print("WARNING: Test dataset is empty. Skipping final evaluation.")
+        if test_loader is None or len(test_loader.dataset) == 0:
+            print("WARNING: Test set is empty. Skipping final evaluation.")
             metrics = {
                 "accuracy": 0.0,
                 "macro_f1": 0.0,
@@ -599,12 +588,12 @@ class SupervisedExperimentTrainer:
             best_ckpt_path = self.run_dir / "checkpoint_best.pth"
             if not best_ckpt_path.exists():
                 print("WARNING: No best checkpoint found. Using current model weights.")
-                metrics = self._evaluate(self.model, test_loader, class_names)
             else:
                 best_ckpt = torch.load(best_ckpt_path, weights_only=False)
-                # FIX 4: Load into raw model for evaluation
-                self.raw_model.load_state_dict(best_ckpt["model_state_dict"])
-                metrics = self._evaluate(self.raw_model, test_loader, class_names)
+                _unwrap_compile(self.model).load_state_dict(
+                    best_ckpt["model_state_dict"]
+                )
+            metrics = self._evaluate(self.model, test_loader, class_names)
 
         self.cb_runner.on_train_end(self)
         return metrics

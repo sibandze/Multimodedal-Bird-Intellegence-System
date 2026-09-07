@@ -3,7 +3,9 @@
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+import random
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -65,12 +67,6 @@ class SimCLRExperimentTrainer:
 
         if callbacks is None:
             callbacks = [
-                CheckpointCallback(
-                    run_dir=self.run_dir,
-                    monitor="val_loss",
-                    mode="min",
-                    state_dict_fn=lambda m: m.encoder.state_dict(),
-                ),
                 EarlyStoppingCallback(
                     monitor="val_loss",
                     mode="min",
@@ -79,6 +75,14 @@ class SimCLRExperimentTrainer:
                 JSONLoggerCallback(self.run_dir),
                 CSVLoggerCallback(self.run_dir),
                 PlotMetricsCallback(self.run_dir),
+                CheckpointCallback(
+                    run_dir=self.run_dir,
+                    monitor="val_loss",
+                    mode="min",
+                    # Strip projection head from best_model.pth — only the
+                    # encoder is useful after pretraining.
+                    state_dict_fn=lambda m: m.encoder.state_dict(),
+                ),
                 WandBLoggerCallback(config, self.run_dir),
             ]
         self.cb_runner = CallbackRunner(callbacks)
@@ -95,7 +99,6 @@ class SimCLRExperimentTrainer:
 
         from sklearn.model_selection import train_test_split
 
-        # Use experiment seed if available, otherwise fall back to 42
         seed = self.config.get("experiment", {}).get("seed", 42)
 
         train_df, val_df = train_test_split(
@@ -174,8 +177,6 @@ class SimCLRExperimentTrainer:
             output_dim=proj_cfg.get("output_dim", 128),
         )
 
-        # FIX: Read temperature from training config, not root config.
-        # Sweep system writes to config["training"]["temperature"].
         temperature = self.config["training"].get("temperature", 0.07)
 
         model = SimCLR(
@@ -191,7 +192,6 @@ class SimCLRExperimentTrainer:
 
         self.model = self._build_model()
 
-        # Print summary
         num_params = sum(p.numel() for p in self.model.parameters())
         print(f"\n>>> Initializing SimCLR Training:")
         print(f"    Device: {self.device}")
@@ -209,7 +209,6 @@ class SimCLRExperimentTrainer:
         epochs = self.config["training"]["epochs"]
         scheduler_type = self.config["training"].get("scheduler_type", "cosine")
         warmup_steps = self.config["training"].get("warmup_steps", 0)
-        # FIX 5: Make total_steps consistent with supervised trainer
         total_steps = max(len(train_loader) * epochs, warmup_steps * 2)
         self.scheduler = create_scheduler(
             optimizer=self.optimizer,
@@ -220,7 +219,7 @@ class SimCLRExperimentTrainer:
         )
         step_frequency = get_scheduler_step_frequency(scheduler_type)
 
-        # Resume if checkpoint exists
+        # Resume from checkpoint
         resume_epoch = 0
         checkpoint_path = self.run_dir / "checkpoint_last.pth"
         if checkpoint_path.exists():
@@ -236,11 +235,20 @@ class SimCLRExperimentTrainer:
                 self.precision.load_state_dict(checkpoint["precision_state_dict"])
             if "callbacks_state_dict" in checkpoint:
                 self.cb_runner.load_state_dict(checkpoint["callbacks_state_dict"])
-            # FIX 2: Restore RNG state on resume
             if "torch_rng_state" in checkpoint:
                 torch.set_rng_state(checkpoint["torch_rng_state"])
             if checkpoint.get("cuda_rng_state") and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+            if checkpoint.get("numpy_rng_state") is not None:
+                np.random.set_state(checkpoint["numpy_rng_state"])
+            if checkpoint.get("python_rng_state") is not None:
+                random.setstate(checkpoint["python_rng_state"])
+
+            checkpoint_logs = checkpoint.get("logs", {})
+
+            self.best_loss = checkpoint_logs.get("best_loss", self.best_loss)
+            self.best_epoch = checkpoint_logs.get("best_epoch", self.best_epoch)
+
             resume_epoch = checkpoint["epoch"]
             print(f"    ✓ Resumed successfully from epoch {resume_epoch + 1}")
 
@@ -255,7 +263,7 @@ class SimCLRExperimentTrainer:
             self.cb_runner.on_epoch_begin(self, epoch)
             epoch_start = time.time()
 
-            # Training
+            # --- Training ---
             self.model.train()
             train_loss_total = 0.0
             train_acc_total = 0.0
@@ -273,10 +281,6 @@ class SimCLRExperimentTrainer:
                     loss, acc = self.model.training_step(x1, x2)
 
                 self.precision.scale_loss(loss).backward()
-
-                # FIX: Always unscale gradients before clipping.
-                # Under mixed precision, gradients are scaled; clipping
-                # without unscaling clips the wrong magnitudes.
                 self.precision.unscale_gradients(self.optimizer)
 
                 grad_clip = self.config["training"].get("gradient_clip")
@@ -302,7 +306,7 @@ class SimCLRExperimentTrainer:
             avg_train_loss = train_loss_total / max(len(train_loader.dataset), 1)
             avg_train_acc = train_acc_total / max(len(train_loader.dataset), 1)
 
-            # Validation
+            # --- Validation ---
             self.model.eval()
             val_loss_total = 0.0
             val_acc_total = 0.0
@@ -319,7 +323,7 @@ class SimCLRExperimentTrainer:
             avg_val_loss = val_loss_total / max(len(val_loader.dataset), 1)
             avg_val_acc = val_acc_total / max(len(val_loader.dataset), 1)
 
-            # FIX 1: Track best loss on trainer instance
+            # Update trainer-level best tracking
             if avg_val_loss < self.best_loss:
                 self.best_loss = avg_val_loss
                 self.best_epoch = epoch + 1
@@ -337,37 +341,25 @@ class SimCLRExperimentTrainer:
                 "learning_rate": self.optimizer.param_groups[0]["lr"],
                 "grad_norm": grad_norm_sum / num_batches if num_batches > 0 else 0.0,
                 "epoch_time_sec": epoch_duration,
+                "best_loss": self.best_loss,
+                "best_epoch": self.best_epoch,
             }
             logs.update(get_gpu_memory_info(self.device))
 
             print(
                 f"Epoch {epoch+1}/{epochs} | {epoch_duration:.1f}s | "
-                f"Train Loss: {avg_train_loss:.4f} | Train Contrastive Acc: {avg_train_acc:.4f} | "
-                f"Val Loss: {avg_val_loss:.4f} | Val Contrastive Acc: {avg_val_acc:.4f}"
+                f"Train Loss: {avg_train_loss:.4f} | "
+                f"Train Contrastive Acc: {avg_train_acc:.4f} | "
+                f"Val Loss: {avg_val_loss:.4f} | "
+                f"Val Contrastive Acc: {avg_val_acc:.4f} | "
+                f"Best: {self.best_loss:.4f} (ep {self.best_epoch})"
             )
 
+            # CheckpointCallback handles all saving:
+            #   checkpoint_last.pth  (every epoch, full model for resumption)
+            #   checkpoint_best.pth  (on improvement, full model for resumption)
+            #   best_model.pth       (on improvement, encoder-only for inference)
             self.cb_runner.on_epoch_end(self, epoch, logs)
-
-            # FIX 2: Save resumable checkpoint (complements CheckpointCallback's best-only save)
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": self.model.state_dict(),
-                    "optimizer_state_dict": self.optimizer.state_dict(),
-                    "scheduler_state_dict": (
-                        self.scheduler.state_dict() if self.scheduler else None
-                    ),
-                    "precision_state_dict": self.precision.state_dict(),
-                    "callbacks_state_dict": self.cb_runner.state_dict(),
-                    "torch_rng_state": torch.random.get_rng_state(),
-                    "cuda_rng_state": (
-                        torch.cuda.get_rng_state_all()
-                        if torch.cuda.is_available()
-                        else None
-                    ),
-                },
-                self.run_dir / "checkpoint_last.pth",
-            )
 
         self.cb_runner.on_train_end(self)
         return {
@@ -375,4 +367,6 @@ class SimCLRExperimentTrainer:
             "val_contrastive_acc": avg_val_acc,
             "train_loss": avg_train_loss,
             "train_contrastive_acc": avg_train_acc,
+            "best_loss": self.best_loss,
+            "best_epoch": self.best_epoch,
         }

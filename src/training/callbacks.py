@@ -15,8 +15,10 @@
 import csv
 import json
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+import random
 import torch
+import numpy as np
 import matplotlib
 
 matplotlib.use("Agg")  # non-interactive backend
@@ -26,6 +28,13 @@ try:
     import wandb
 except ImportError:
     wandb = None
+
+
+def _unwrap_compile(model):
+    """Return the underlying module if model was wrapped by torch.compile."""
+    if hasattr(model, "_orig_mod"):
+        return model._orig_mod
+    return model
 
 
 class Callback:
@@ -166,16 +175,26 @@ class EarlyStoppingCallback(Callback):
 # =====================================================================
 class CheckpointCallback(Callback):
     """
-    Generic checkpoint callback for any training mode.
+    Manages all checkpoint I/O. Trainers never call torch.save directly.
 
-    - Always saves the latest full checkpoint (`checkpoint_last.pth`) for resumption.
-    - Saves the best full checkpoint (`checkpoint_best.pth`) for resumption.
-    - Saves weights-only files (`last_model.pth`, `best_model.pth`) using
-      `state_dict_fn` if provided, otherwise the full model state dict.
+    Every epoch:
+      - checkpoint_last.pth  : full resumable checkpoint (complete model state
+        dict, optimizer, scheduler, precision, callbacks, RNG). Always contains
+        the full model including any projection head.
 
-    For SSL pretraining, pass `state_dict_fn=lambda m: m.encoder.state_dict()`
-    so that only the encoder is saved in the weights files — the projection head
-    is discarded since it's only useful during contrastive training.
+    On improvement:
+      - checkpoint_best.pth  : same full resumable checkpoint at best metric.
+      - best_model.pth       : weights-only file for inference/linear probing.
+        Uses state_dict_fn if provided (e.g. lambda m: m.encoder.state_dict()
+        for SSL to strip the projection head).
+
+    Args:
+        run_dir: Directory to save checkpoints.
+        monitor: Metric name to watch for improvement.
+        mode: 'max' (higher is better) or 'min' (lower is better).
+        state_dict_fn: Optional callable(model) -> state_dict. When provided,
+            best_model.pth contains only the result of this call. When None,
+            best_model.pth contains the full model state dict.
     """
 
     def __init__(
@@ -191,14 +210,38 @@ class CheckpointCallback(Callback):
         self.best_score = float("-inf") if mode == "max" else float("inf")
         self.state_dict_fn = state_dict_fn
 
-    def _get_weights_state_dict(self, model):
-        """Extract state dict for the weights-only file."""
-        if self.state_dict_fn is not None:
-            return self.state_dict_fn(model)
-        return model.state_dict()
+    def _build_checkpoint(self, trainer, epoch: int, logs: Dict[str, Any]) -> dict:
+        """Build a full resumable checkpoint dict from current trainer state."""
+        raw_model = _unwrap_compile(trainer.model)
+        return {
+            "epoch": epoch + 1,
+            "logs": logs,
+            "model_state_dict": raw_model.state_dict(),
+            "optimizer_state_dict": trainer.optimizer.state_dict(),
+            "scheduler_state_dict": (
+                trainer.scheduler.state_dict() if trainer.scheduler else None
+            ),
+            "precision_state_dict": trainer.precision.state_dict(),
+            "callbacks_state_dict": trainer.cb_runner.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None
+            ),
+            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": random.getstate(),
+            "git_commit": getattr(trainer, "git_hash", None),
+            "torch_version": torch.__version__,
+            "cuda_version": (
+                torch.version.cuda if torch.cuda.is_available() else None
+            ),
+        }
 
     def on_epoch_end(self, trainer, epoch: int, logs: Dict[str, Any]):
         current_score = logs.get(self.monitor)
+        if current_score is None:
+            return
 
         improved = (
             current_score > self.best_score
@@ -209,38 +252,25 @@ class CheckpointCallback(Callback):
         if improved:
             self.best_score = current_score
 
-        # Full checkpoint — always saves everything for resumption
-        checkpoint = {
-            "epoch": epoch + 1,
-            "logs": logs,
-            "model_state_dict": trainer.model.state_dict(),
-            "optimizer_state_dict": trainer.optimizer.state_dict(),
-            "scheduler_state_dict": (
-                trainer.scheduler.state_dict() if trainer.scheduler else None
-            ),
-            "precision_state_dict": trainer.precision.state_dict(),
-            "callbacks_state_dict": trainer.cb_runner.state_dict(),
-            "torch_rng_state": torch.get_rng_state(),
-            "cuda_rng_state": (
-                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-            ),
-            "git_commit": getattr(trainer, "git_hash", None),
-            "torch_version": torch.__version__,
-            "cuda_version": (torch.version.cuda if torch.cuda.is_available() else None),
-        }
-
-        # Weights-only — uses state_dict_fn if provided
-        weights = self._get_weights_state_dict(trainer.model)
-
+        # Always save last checkpoint for resumption
+        checkpoint = self._build_checkpoint(trainer, epoch, logs)
         torch.save(checkpoint, self.run_dir / "checkpoint_last.pth")
-        torch.save(weights, self.run_dir / "last_model.pth")
 
         if improved:
+            # Full checkpoint at best metric for resumption
             torch.save(checkpoint, self.run_dir / "checkpoint_best.pth")
+
+            # Weights-only for inference (strips projection head for SSL if
+            # state_dict_fn was provided)
+            if self.state_dict_fn is not None:
+                weights = self.state_dict_fn(_unwrap_compile(trainer.model))
+            else:
+                weights = _unwrap_compile(trainer.model).state_dict()
             torch.save(weights, self.run_dir / "best_model.pth")
 
             print(
-                f"    ✓ Saved new best model " f"({self.monitor}: {current_score:.4f})"
+                f"    ✓ Saved new best model "
+                f"({self.monitor}: {current_score:.4f})"
             )
 
     def state_dict(self) -> Dict[str, Any]:
@@ -306,7 +336,6 @@ class WandBLoggerCallback(Callback):
             resume="allow",
             id=log_cfg.get("wandb_run_id", self.run_dir.name),
         )
-        # Watch gradients and parameters
         wandb.watch(trainer.model, log="gradients", log_freq=100)
 
     def on_epoch_end(self, trainer, epoch: int, logs: Dict[str, Any]):
@@ -318,7 +347,6 @@ class WandBLoggerCallback(Callback):
         if not self.enabled:
             return
 
-        # Save best monitored metric if available
         if hasattr(trainer, "best_val_acc"):
             wandb.summary["best_val_acc"] = trainer.best_val_acc
         elif hasattr(trainer, "best_loss"):
@@ -339,16 +367,14 @@ class WandBLoggerCallback(Callback):
 
 
 # =====================================================================
-# 5. Plot Metrics Callback
+# 6. Plot Metrics Callback
 # =====================================================================
 class PlotMetricsCallback(Callback):
     """
-    Plots training metrics across epochs (e.g., loss, accuracy).
+    Plots training metrics across epochs.
 
-    - Saves plots after each epoch (overwrites same file).
-    - Automatically selects numeric metrics from logs.
-    - Supports both supervised (train_acc, val_acc) and SSL
-      (train_contrastive_acc, val_contrastive_acc).
+    Saves plots after each epoch (overwrites same file).
+    Automatically selects numeric metrics from logs.
     """
 
     def __init__(
@@ -359,7 +385,7 @@ class PlotMetricsCallback(Callback):
     ):
         self.run_dir = Path(run_dir)
         self.history: List[Dict[str, Any]] = []
-        self.metrics = metrics  # if None, auto-detect
+        self.metrics = metrics
         self.figsize = figsize
 
     def on_epoch_end(self, trainer, epoch: int, logs: Dict[str, Any]):
@@ -367,17 +393,13 @@ class PlotMetricsCallback(Callback):
         self._plot()
 
     def on_train_end(self, trainer):
-        # Final plot to ensure it's up‑to‑date
         self._plot()
 
     def _plot(self):
         if not self.history:
             return
 
-        # Determine metrics to plot
         if self.metrics is None:
-            # Auto-detect: all keys that are numeric and change across epochs
-            # Here we simply plot all keys that are int/float and are not metadata
             excluded = {
                 "epoch",
                 "learning_rate",
@@ -398,7 +420,6 @@ class PlotMetricsCallback(Callback):
         if not metrics:
             return
 
-        # Create figure with subplots for each metric
         num_metrics = len(metrics)
         fig, axes = plt.subplots(
             1, num_metrics, figsize=(self.figsize[0] * num_metrics, self.figsize[1])
@@ -410,7 +431,6 @@ class PlotMetricsCallback(Callback):
 
         for ax, metric in zip(axes, metrics):
             values = [h.get(metric) for h in self.history]
-            # Remove None values
             clean_epochs = [e for e, v in zip(epochs, values) if v is not None]
             clean_values = [v for v in values if v is not None]
             if not clean_values:
@@ -438,5 +458,4 @@ class PlotMetricsCallback(Callback):
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.history = state_dict.get("history", [])
-        # Re‑plot if history was loaded (for resume)
         self._plot()
