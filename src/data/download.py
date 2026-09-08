@@ -5,7 +5,10 @@ from typing import Optional
 
 import requests
 
-def download_audio(url: str, filename: str, output_dir: str | Path, chunk_size = 8192) -> Optional[Path]:
+
+def download_audio(
+    url: str, filename: str, output_dir: str | Path, chunk_size=8192
+) -> Optional[Path]:
     """
     Downloads an audio file from a given URL.
 
