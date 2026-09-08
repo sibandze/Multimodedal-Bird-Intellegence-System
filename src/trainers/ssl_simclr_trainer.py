@@ -71,9 +71,7 @@ class SimCLRExperimentTrainer(BaseTrainer):
         window_config = self.config.get("window", {})
         seed = self.config.get("experiment", {}).get("seed", 42)
 
-        train_df, val_df = train_test_split(
-            df, test_size=0.05, random_state=seed
-        )
+        train_df, val_df = train_test_split(df, test_size=0.05, random_state=seed)
 
         train_dataset = SimCLRDataset(
             df=train_df,
@@ -126,9 +124,7 @@ class SimCLRExperimentTrainer(BaseTrainer):
         )
         temperature = self.config["training"].get("temperature", 0.07)
 
-        model = SimCLR(
-            encoder=encoder, projection=projection, temperature=temperature
-        )
+        model = SimCLR(encoder=encoder, projection=projection, temperature=temperature)
         return model.to(self.device)
 
     # ── printing ────────────────────────────────────────────────────────
@@ -220,9 +216,7 @@ class SimCLRExperimentTrainer(BaseTrainer):
     def _post_train(self) -> Dict[str, Any]:
         return {
             "val_loss": self._last_val_metrics.get("val_loss", 0),
-            "val_contrastive_acc": self._last_val_metrics.get(
-                "val_contrastive_acc", 0
-            ),
+            "val_contrastive_acc": self._last_val_metrics.get("val_contrastive_acc", 0),
             "train_loss": self._last_train_metrics.get("train_loss", 0),
             "train_contrastive_acc": self._last_train_metrics.get(
                 "train_contrastive_acc", 0
