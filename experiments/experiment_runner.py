@@ -32,7 +32,6 @@ from experiments.sweep_configs import SWEEP_SUITES
 from src.trainers import SupervisedTransformerExperimentTrainer
 from src.trainers import SimCLRExperimentTrainer
 
-
 # Which suites are SSL vs supervised (by naming convention)
 SSL_SUITE_PREFIXES = ("ssl_",)
 
@@ -96,20 +95,22 @@ class ExperimentManager:
             csv_path = resolve_metadata_csv_path(self.base_config)
             if not os.path.exists(csv_path):
                 raise FileNotFoundError(
-                   f"Processed CSV not found at {csv_path}.",
-                   f"Run data pipeline first: python main.py --pipeline"
+                    f"Processed CSV not found at {csv_path}.",
+                    f"Run data pipeline first: python main.py --pipeline",
                 )
             full_df = pd.read_csv(csv_path)
             print(f"✓ Loaded {len(full_df)} samples from {csv_path}")
 
             # ---- Distillation ----
-            data_cfg = self.base_config.get('data', {})
-            requested_classes = data_cfg.get('num_classes')
-            requested_samples = data_cfg.get('num_samples_per_class')
-            label_col = data_cfg.get('label_column')
+            data_cfg = self.base_config.get("data", {})
+            requested_classes = data_cfg.get("num_classes")
+            requested_samples = data_cfg.get("num_samples_per_class")
+            label_col = data_cfg.get("label_column")
 
             if requested_classes and requested_samples:
-                print(f"🔬 Distilling dataset to {requested_classes} classes x {requested_samples} samples each")
+                print(
+                    f"🔬 Distilling dataset to {requested_classes} classes x {requested_samples} samples each"
+                )
 
                 # Group by label
                 grouped = full_df.groupby(label_col)
@@ -143,7 +144,9 @@ class ExperimentManager:
                         requested_classes = new_num_classes
 
                 selected_classes = eligible_classes.index[:requested_classes].tolist()
-                print(f"   Selected {len(selected_classes)} classes with {requested_samples} samples each")
+                print(
+                    f"   Selected {len(selected_classes)} classes with {requested_samples} samples each"
+                )
                 print(f"   Classes: {selected_classes}")
 
                 # Sample per class
@@ -158,11 +161,13 @@ class ExperimentManager:
                 print(f"✓ Final distilled dataset: {len(self.df)} samples")
 
                 # Optional: shuffle the final dataset
-                self.df = self.df.sample(frac=1, random_state=rng).reset_index(drop=True)
+                self.df = self.df.sample(frac=1, random_state=rng).reset_index(
+                    drop=True
+                )
 
                 # Update config with actual values used
-                self.base_config['data']['num_classes'] = requested_classes
-                self.base_config['data']['num_samples_per_class'] = requested_samples
+                self.base_config["data"]["num_classes"] = requested_classes
+                self.base_config["data"]["num_samples_per_class"] = requested_samples
             else:
                 # If no distillation requested, use full dataset
                 self.df = full_df
@@ -176,7 +181,10 @@ class ExperimentManager:
         return self.mode
 
     def create_experiment_run(
-        self, sweep_name: str, run_index: int, hyperparams: Dict[str, Any],
+        self,
+        sweep_name: str,
+        run_index: int,
+        hyperparams: Dict[str, Any],
         run_seed: int,
     ) -> tuple:
         """Create a unique directory and config for this experiment run."""
@@ -202,7 +210,10 @@ class ExperimentManager:
         return run_dir, run_config
 
     def _merge_config_with_hyperparams(
-        self, hyperparams: Dict[str, Any], run_dir: Path, run_name: str,
+        self,
+        hyperparams: Dict[str, Any],
+        run_dir: Path,
+        run_name: str,
         run_seed: int,
     ) -> Dict:
         """
@@ -214,7 +225,14 @@ class ExperimentManager:
         config = yaml.safe_load(yaml.dump(self.base_config))  # Deep copy
 
         # Ensure sections exist
-        for section in ("training", "model", "augmentation", "logging", "projection", "experiment"):
+        for section in (
+            "training",
+            "model",
+            "augmentation",
+            "logging",
+            "projection",
+            "experiment",
+        ):
             if section not in config:
                 config[section] = {}
 
@@ -266,9 +284,7 @@ class ExperimentManager:
                 for r in reader:
                     existing_rows.append(r)
 
-            all_fieldnames = list(
-                dict.fromkeys(existing_fieldnames + list(row.keys()))
-            )
+            all_fieldnames = list(dict.fromkeys(existing_fieldnames + list(row.keys())))
 
             with open(self.results_csv, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=all_fieldnames)
@@ -298,9 +314,7 @@ class ExperimentManager:
         mode = self._resolve_mode(sweep_name)
 
         if dry_run:
-            print(
-                f"  [{run_index}] [DRY RUN] [{mode}] Would train with: {hyperparams}"
-            )
+            print(f"  [{run_index}] [DRY RUN] [{mode}] Would train with: {hyperparams}")
             print(f"      Seed: {run_seed}")
             print(f"      Config: {run_dir}/config.yaml")
             return None
@@ -397,12 +411,8 @@ class ExperimentManager:
                     sort_col = "accuracy"
                     ascending = False
                     summary += "### Top 5 Runs by Accuracy\n\n"
-                    summary += (
-                        "| Run ID | Accuracy | Macro F1 | Learning Rate | Batch Size | Seed |\n"
-                    )
-                    summary += (
-                        "|--------|----------|----------|---------------|------------|------|\n"
-                    )
+                    summary += "| Run ID | Accuracy | Macro F1 | Learning Rate | Batch Size | Seed |\n"
+                    summary += "|--------|----------|----------|---------------|------------|------|\n"
 
                     df_sorted = df_results.sort_values(sort_col, ascending=ascending)
                     for _, row in df_sorted.head(5).iterrows():
@@ -459,9 +469,7 @@ class ExperimentManager:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run hyperparameter sweep experiments"
-    )
+    parser = argparse.ArgumentParser(description="Run hyperparameter sweep experiments")
     parser.add_argument(
         "--suite",
         type=str,
