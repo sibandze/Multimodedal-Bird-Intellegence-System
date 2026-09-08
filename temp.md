@@ -1,504 +1,413 @@
-This is now a much stronger version. The previous callback-order problem is fixed, best-metric state is restored on resume, and supervised compilation/checkpoint loading is handled in the right order.
+```markdown
+# Experiments & Evaluation Pipeline
 
-I found **two immediate bugs** and a few remaining design issues.
+This document describes the comprehensive experiments framework for the
+Multimodal Bird Intelligence System. The pipeline supports both **supervised
+classification** and **self-supervised learning (SimCLR)** experiments with
+systematic hyperparameter sweeps.
 
-## 1. Immediate bug: `random` is used but not imported
+## Overview
 
-Both trainers contain:
+The experiments pipeline enables:
+
+1. **Systematic hyperparameter sweeps** with reproducible, per-run configurations
+2. **Dual-mode training** — supervised classification and SSL (SimCLR contrastive)
+3. **Comprehensive evaluation metrics** at the per-class and overall level
+4. **Detailed logging** of all runs for later comparison
+5. **Data distillation** — subsample N classes × M samples for fast iteration
+6. **Baseline establishment** for comparing supervised vs. contrastive approaches
+
+## Directory Structure
+
+```
+experiments/
+├── sweep_configs.py          # Hyperparameter sweep definitions
+├── experiment_runner.py       # Main experiment orchestration
+├── EXPERIMENTS.md            # This file
+└── results/                  # Output directory (created at runtime)
+    └── exp_YYYYMMDD_HHMMSS/  # Timestamped experiment batch
+        ├── EXPERIMENT_SUMMARY.md
+        ├── results.csv              # Aggregate results across all runs
+        └── run_0000_sweep_name/    # Individual run directories
+            ├── config.yaml          # Exact config used for this run
+            ├── best_model.pth       # Trained model checkpoint
+            ├── label_mappings.json  # Class-name ↔ index mapping
+            ├── training_metrics.json # Epoch-by-epoch logs
+            ├── evaluation_metrics.json  # Final test metrics (supervised)
+            ├── EVALUATION_REPORT.md     # Markdown evaluation report
+            ├── confusion_matrix.png
+            └── per_class_metrics.png
+```
+
+## Quick Start
+
+### 1. Dry-Run a Sweep
+
+Preview what would run without actually training:
+
+```bash
+python -m experiments.experiment_runner \
+  --suite quick_baseline \
+  --config configs/config.yaml \
+  --dry-run
+```
+
+### 2. Supervised Baseline
+
+```bash
+python -m experiments.experiment_runner \
+  --suite standard_baseline \
+  --config configs/config.yaml \
+  --seed 42
+```
+
+### 3. SSL (SimCLR) Sanity Check
+
+Verify the contrastive learning pipeline works end-to-end:
+
+```bash
+python -m experiments.experiment_runner \
+  --suite ssl_sanity \
+  --config configs/config.yaml \
+  --mode ssl \
+  --seed 42
+```
+
+### 4. Comprehensive SSL Sweep
+
+```bash
+python -m experiments.experiment_runner \
+  --suite ssl_comprehensive \
+  --config configs/config.yaml \
+  --mode ssl \
+  --seed 42
+```
+
+## Command-Line Reference
+
+```
+python -m experiments.experiment_runner [OPTIONS]
+
+Options:
+  --suite       Sweep suite to run (see Available Sweep Suites below)
+  --mode        Training mode: supervised | ssl | auto (default: auto)
+                'auto' infers from suite name prefix (ssl_* → SSL, else supervised)
+  --config      Path to base config file (default: configs/config.yaml)
+  --results-dir Directory for experiment outputs (default: results/)
+  --dry-run     Print configurations without training
+  --seed        Base random seed (default: 42)
+```
+
+## Mode Selection
+
+The runner supports two training modes:
+
+| Mode         | Trainer                      | Metrics Tracked                                          |
+|--------------|------------------------------|----------------------------------------------------------|
+| `supervised` | `SupervisedExperimentTrainer`| accuracy, macro_f1, weighted_f1, per-class breakdowns    |
+| `ssl`        | `SimCLRExperimentTrainer`    | val_loss, val_contrastive_acc, per-epoch contrastive acc |
+
+**Auto-detection:** Suites whose name starts with `ssl_` are automatically
+treated as SSL mode. For all other suites, supervised mode is used. Override
+with `--mode supervised` or `--mode ssl` if needed.
+
+## Available Sweep Suites
+
+### Supervised Suites
+
+| Suite                | Runs | Description                                             | Est. Time   |
+|----------------------|------|---------------------------------------------------------|-------------|
+| `quick_baseline`     | 5    | Learning rate sensitivity: 1e-5 → 1e-3                 | ~50 min     |
+| `standard_baseline`  | 60   | LR × batch size × dropout grid                         | ~10 hours   |
+| `comprehensive`      | 3600 | Full architecture search (embed_dim, layers, heads)    | Several days|
+| `optimization_focus` | 36   | LR + weight decay, warmup, scheduler, mixed precision  | ~6 hours    |
+| `scheduler_ablation` | 27   | Cosine warm-restarts + other scheduler comparisons     | ~4.5 hours  |
+
+#### `quick_baseline` (5 configs)
+Best for verifying the pipeline end-to-end before committing to long sweeps.
+
+#### `standard_baseline` (60 configs)
+- Learning rates: `[1e-5, 5e-5, 1e-4, 5e-4, 1e-3]`
+- Batch sizes: `[16, 32, 64]`
+- Dropout rates: `[0.0, 0.1, 0.2, 0.3]`
+
+#### `comprehensive` (3,600 configs)
+All of `standard_baseline` plus architecture search:
+- Embedding dimensions: `[128, 256, 512]`
+- Number of layers: `[3, 6, 12]`
+- Number of heads: `[4, 8, 16]`
+
+#### `optimization_focus` (36 configs)
+Focused on training dynamics:
+- LR + weight decay combinations
+- Scheduler types: constant, cosine, linear_decay, reduce_on_plateau, cosine_warm_restarts
+- Warmup steps: `[0, 500, 1000]`
+- Mixed precision: on/off
+
+#### `scheduler_ablation` (27 configs)
+Deep-dive into scheduling strategies:
+- Cosine warm-restarts with varying warmup (250–2000 steps) and minimum LR
+- Cross-scheduler comparison with different warmup durations
+
+### SSL Suites
+
+| Suite                | Runs | Description                                              | Est. Time   |
+|----------------------|------|----------------------------------------------------------|-------------|
+| `ssl_sanity`         | 1    | Single quick config to verify SSL pipeline               | ~10 min     |
+| `ssl_lr`             | 4    | Learning rate sweep for SimCLR pretraining               | ~40 min     |
+| `ssl_standard`       | 20   | LR × temperature × weight decay                          | ~3.3 hours  |
+| `ssl_comprehensive`  | 720  | Full SSL sweep (LR, temp, projection, batch, aug, decay) | ~5 days     |
+
+#### `ssl_sanity` (1 config)
+Single run: `lr=3e-4, batch=16, temp=0.07`. Use this to verify your SSL
+pipeline before launching longer sweeps.
+
+#### `ssl_lr` (4 configs)
+Learning rates: `[1e-4, 3e-4, 5e-4, 1e-3]`
+
+#### `ssl_standard` (20 configs)
+- Learning rates: `[1e-4, 3e-4, 5e-4, 1e-3]`
+- Temperature: `[0.03, 0.05, 0.07, 0.1, 0.2]`
+- Weight decay: `[0.0, 1e-6, 1e-5, 1e-4, 1e-3]`
+
+#### `ssl_comprehensive` (720 configs)
+All of `ssl_standard` plus:
+- Projection head hidden dim: `[128, 256, 512]`
+- Projection head output dim: `[64, 128, 256]`
+- Batch sizes: `[16, 32, 64, 128]`
+- Augmentation strength: probability `[0.3–0.9]`, freq/time masking params
+
+## Per-Run Seeding
+
+Each run uses a deterministic seed derived from the base seed:
+
+```
+run_seed = base_seed + run_index
+```
+
+This ensures:
+- Each run has distinct randomness (different data shuffles, augmentation draws)
+- Runs are fully reproducible from their seed alone
+- The base seed is logged in the experiment summary
+
+## Data Distillation
+
+For fast iteration, you can subsample the dataset via config:
+
+```yaml
+data:
+  num_classes: 20              # Use only the top 20 classes by sample count
+  num_samples_per_class: 50    # Take 50 samples per class
+```
+
+When both values are set, the runner:
+1. Ranks classes by sample count (descending)
+2. Selects the top `num_classes` that have at least `num_samples_per_class` samples
+3. Randomly samples `num_samples_per_class` from each
+4. Shuffles the result
+
+If neither value is set, the full dataset is used.
+
+## Results Analysis
+
+### `results.csv`
+
+Aggregate metrics for all runs in one CSV. Columns include:
+
+**Always present:**
+- `run_id`, `sweep_name`, `timestamp`
+
+**Sweep hyperparameters** (dotted-path keys):
+- e.g. `training.learning_rate`, `training.batch_size`, `model.dropout`
+
+**Supervised metrics:**
+- `accuracy`, `macro_f1`, `weighted_f1`
+
+**SSL metrics:**
+- `val_loss`, `val_contrastive_acc`
+
+**On error:**
+- `error` (message), `error_traceback` (full traceback)
+
+### `EXPERIMENT_SUMMARY.md`
+
+Auto-generated summary at the end of a sweep. Contains:
+- Experiment ID, mode, timestamp, total runs, base seed
+- Top 5 runs ranked by the mode-appropriate metric
+  - Supervised: sorted by accuracy (highest first)
+  - SSL: sorted by val_loss (lowest first)
+- Next-step recommendations
+
+### Per-Run Artifacts
+
+Each `run_XXXX_sweep_name/` directory contains:
+
+| File                        | Description                                         |
+|-----------------------------|-----------------------------------------------------|
+| `config.yaml`               | Exact config used — **always check this**           |
+| `best_model.pth`            | Best checkpoint (encoder-only for SSL)              |
+| `label_mappings.json`       | Class name ↔ integer index mapping                  |
+| `training_metrics.json`     | Epoch-by-epoch loss, accuracy, etc.                 |
+| `evaluation_metrics.json`   | Final test metrics with per-class breakdowns        |
+| `EVALUATION_REPORT.md`      | Human-readable report with key findings             |
+| `confusion_matrix.png`      | Confusion matrix heatmap                            |
+| `per_class_metrics.png`     | Precision/recall/F1 bar chart per class             |
+
+**Note:** SSL checkpoints (`best_model.pth`) contain encoder weights only
+(the projection head is excluded) so they can be used directly for linear
+probing or fine-tuning.
+
+## Workflow: Baseline → Contrastive → Comparison
+
+### Phase 1 — Supervised Baseline
+1. `--suite standard_baseline` (or `comprehensive` if compute allows)
+2. Inspect `results.csv` — sort by accuracy/macro_f1
+3. Identify best hyperparameters; document in `BASELINE_CONFIG.md`
+4. Save the best run's checkpoint
+
+### Phase 2 — SSL Pretraining
+1. `--suite ssl_sanity` to verify pipeline
+2. `--suite ssl_standard` for meaningful sweep
+3. Review `results.csv` — sort by val_loss
+4. Best encoder checkpoint → linear probing evaluation
+
+### Phase 3 — Comparison
+1. Compare supervised baseline vs. SSL linear probe
+2. Generate comparison plots and tables
+3. Document findings
+
+## Extending the Framework
+
+### Adding a New Sweep
+
+Edit `experiments/sweep_configs.py`:
 
 ```python
-random.setstate(checkpoint["python_rng_state"])
-```
-
-but neither file imports:
-
-```python
-import random
-```
-
-So an SSL or supervised resume with `python_rng_state` present will fail with:
-
-```text
-NameError: name 'random' is not defined
-```
-
-Add to both:
-
-```python
-import random
-```
-
-This is currently the most concrete runtime bug in the code shown.
-
----
-
-## 2. Supervised still doesn't restore NumPy/Python RNG state
-
-SSL restores:
-
-```python
-torch.set_rng_state(...)
-torch.cuda.set_rng_state_all(...)
-np.random.set_state(...)
-random.setstate(...)
-```
-
-Supervised currently restores only:
-
-```python
-torch.set_rng_state(...)
-torch.cuda.set_rng_state_all(...)
-```
-
-But your checkpoint contains NumPy state and, assuming the callback version you showed, Python state too.
-
-For symmetry and reproducibility, supervised should restore all four:
-
-```python
-if checkpoint.get("python_rng_state") is not None:
-    random.setstate(checkpoint["python_rng_state"])
-
-if checkpoint.get("numpy_rng_state") is not None:
-    np.random.set_state(checkpoint["numpy_rng_state"])
-
-if "torch_rng_state" in checkpoint:
-    torch.set_rng_state(checkpoint["torch_rng_state"])
-
-if checkpoint.get("cuda_rng_state") and torch.cuda.is_available():
-    torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
-```
-
-And supervised already restores:
-
-```python
-self.best_val_acc
-self.best_epoch
-```
-
-correctly from checkpoint logs.
-
----
-
-# 3. Your callback ordering is now correct
-
-You now have:
-
-```text
-EarlyStopping
-JSON Logger
-CSV Logger
-Plot Metrics
-Checkpoint
-W&B
-```
-
-That fixes the previous stale-state problem.
-
-The checkpoint is built after the trainer has updated:
-
-```text
-best_loss / best_val_acc
-best_epoch
-```
-
-and after the earlier callbacks have updated their state.
-
-That's the right direction.
-
-One thing I'd still keep in mind: W&B is after checkpointing now, which is preferable because an external logging failure won't prevent the checkpoint from being written.
-
----
-
-# 4. SSL resume is now logically correct, assuming the missing import is fixed
-
-This sequence is good:
-
-```python
-self.cb_runner.load_state_dict(...)
-...
-checkpoint_logs = checkpoint.get("logs", {})
-
-self.best_loss = checkpoint_logs.get("best_loss", self.best_loss)
-self.best_epoch = checkpoint_logs.get("best_epoch", self.best_epoch)
-```
-
-Now a run resumed from:
-
-```text
-epoch 37
-best_loss = 0.82
-best_epoch = 31
-```
-
-continues with those values instead of resetting to:
-
-```text
-inf / 0
-```
-
-So the first resumed epoch cannot incorrectly become the best merely because of the reset.
-
----
-
-# 5. Supervised final evaluation is now correctly compile-safe
-
-This is good:
-
-```python
-_unwrap_compile(self.model).load_state_dict(
-    best_ckpt["model_state_dict"]
+MY_SWEEP = HyperparameterSweep(
+    name="my_custom_sweep",
+    description="Tests something specific",
+    params={
+        "training.learning_rate": [1e-4, 5e-4],
+        "model.embed_dim": [128, 256],
+    },
 )
+
+SWEEP_SUITES["my_suite"] = [MY_SWEEP]
 ```
 
-Combined with:
+Then run:
+```bash
+python -m experiments.experiment_runner --suite my_suite
+```
+
+Sweep parameters use **dotted config paths** matching the YAML structure
+(e.g. `training.learning_rate`, `augmentation.prob`,
+`training.mixed_precision.enabled`). These are applied via
+`set_nested_config()` — no mapping dictionary is needed.
+
+### Adding a New SSL Sweep Suite
+
+Prefix the suite name with `ssl_` so auto-detection works:
 
 ```python
-# load checkpoint into uncompiled model
-...
-if compiled:
-    self.model = torch.compile(self.model)
+SWEEP_SUITES["ssl_my_experiment"] = [MY_SSL_SWEEP]
 ```
 
-you now have a stable serialization boundary:
+Or explicitly pass `--mode ssl`.
 
-```text
-checkpoint
-   ↓
-uncompiled model
-   ↓
-load weights
-   ↓
-compile wrapper
-   ↓
-training/evaluation
-```
+### Adding New Metrics
 
-That's what I'd keep.
-
----
-
-# 6. One remaining problem: `self.best_*` is not part of explicit checkpoint state
-
-You restore it indirectly through:
+Edit `src/evaluation/metrics_collector.py` → `compute_metrics()`:
 
 ```python
-checkpoint["logs"]
+def compute_metrics(self) -> Dict[str, Any]:
+    # ... existing code ...
+    my_metric = compute_my_metric(all_preds, all_labels)
+    self.metrics["my_metric"] = my_metric
+    return self.metrics
 ```
 
-That's workable, and in your current design it's correct because checkpointing occurs after the epoch's logs are constructed.
+## Configuration Reference
 
-But conceptually I'd prefer the checkpoint to contain:
+### Base Config: `configs/config.yaml`
 
-```python
-"trainer_state": {
-    "best_val_acc": ...,
-    "best_epoch": ...
-}
+```yaml
+training:
+  batch_size: 32
+  epochs: 100
+  learning_rate: 0.0001
+  device: "cuda"
+  weight_decay: 0.0
+  warmup_steps: 0
+  scheduler_type: "constant"         # constant | cosine | linear_decay | reduce_on_plateau | cosine_warm_restarts
+  min_lr: 1e-6                       # Floor LR for cosine scheduler
+  mixed_precision:
+    enabled: false                   # AMP training (~2x speedup on modern GPUs)
+  temperature: 0.07                  # Contrastive temperature (SSL only)
+
+model:
+  embed_dim: 256
+  num_layers: 6
+  heads: 8
+  dropout: 0.1
+
+augmentation:
+  enabled: true
+  prob: 0.5
+  freq_mask_param: 6
+  time_mask_param: 10
+
+projection:                          # SSL projection head
+  hidden_dim: 256
+  output_dim: 128
+
+data:
+  num_classes: null                  # null = use all classes
+  num_samples_per_class: null        # null = use all samples
+  label_column: "label"             # Column name in CSV
+
+logging:
+  wandb_project: "bird-song-classifier"
 ```
 
-or:
+## Reproducibility
 
-```python
-"trainer_state": {
-    "best_loss": ...,
-    "best_epoch": ...
-}
+- **Base seed** is set via `--seed` (default: 42)
+- **Per-run seed** = `base_seed + run_index` for distinct but deterministic runs
+- Seeds are set for `random`, `numpy`, and `torch` (including CUDA)
+- Full config is saved per-run in `config.yaml`
+- To reproduce a specific run, use the saved `config.yaml` directly
+
+## Troubleshooting
+
+### Out of Memory (OOM)
+- Reduce `training.batch_size`
+- Reduce `model.embed_dim` or `model.num_layers`
+- Enable `training.mixed_precision.enabled: true`
+
+### Slow Training
+- Increase `training.batch_size`
+- Enable mixed precision for ~2x speedup
+- Use data distillation (`num_classes` / `num_samples_per_class`) for faster iteration
+- Reduce `model.num_layers`
+
+### Results Not Improving
+- Check learning rate — too high causes loss oscillation, too low stalls progress
+- Check augmentation strength — `augmentation.prob` might be too aggressive
+- Increase model capacity (`embed_dim`, `num_layers`)
+- For SSL: check temperature and batch size (more negatives generally helps)
+
+### SSL Pipeline Issues
+- Start with `ssl_sanity` suite — a single run with known-good params
+- Ensure batch size ≥ 16 (contrastive learning needs negative samples)
+- Check that augmentation produces meaningfully different views
+
+## Next Steps
+
+1. ✅ Run `quick_baseline` to verify the supervised pipeline works
+2. ✅ Run `standard_baseline` to establish baseline metrics
+3. ✅ Review `results.csv` to find the best supervised config
+4. ✅ Run `ssl_sanity` to verify the SSL pipeline works
+5. ✅ Run `ssl_standard` to find the best contrastive pretraining config
+6. ⏭️ Linear-probe the best SSL encoder against the supervised baseline
 ```
-
-Then the distinction becomes:
-
-```text
-logs
-    what happened this epoch
-
-trainer_state
-    persistent state needed to continue training
-```
-
-This matters once you add things like:
-
-```text
-accumulated steps
-global_step
-best metric
-early-stop state
-current epoch
-```
-
-Not necessary for your current experiment, but it's the cleaner long-term architecture.
-
----
-
-# 7. SSL still has no protection against an empty validation set
-
-Supervised now handles:
-
-```python
-val_loader = None
-```
-
-but SSL always assumes:
-
-```python
-len(val_loader.dataset) > 0
-```
-
-and does:
-
-```python
-avg_val_loss = val_loss_total / max(len(val_loader.dataset), 1)
-```
-
-The `max(..., 1)` prevents division by zero, but it does **not** solve the semantic problem.
-
-If the validation dataset is empty:
-
-```text
-val_loss = 0
-val_acc = 0
-```
-
-and then:
-
-```python
-if avg_val_loss < self.best_loss:
-```
-
-makes zero the best possible loss.
-
-That would be disastrous for SSL checkpoint selection.
-
-I'd either guarantee a non-empty SSL validation set or explicitly handle it:
-
-```python
-if len(val_loader.dataset) == 0:
-    raise ValueError("SSL validation dataset is empty.")
-```
-
-For your research framework, I actually prefer failing fast rather than silently producing a meaningless "best model."
-
----
-
-# 8. Same issue with SSL split methodology
-
-You're still doing:
-
-```python
-train_df, val_df = train_test_split(
-    df,
-    test_size=0.05,
-    random_state=seed,
-)
-```
-
-without stratification.
-
-Given your project, I'd strongly consider:
-
-```python
-stratify=df["scientific_name_id"]
-```
-
-provided every class has enough recordings for the 95/5 split.
-
-The important distinction is:
-
-```text
-labels used for splitting
-≠
-labels used for SSL training
-```
-
-That remains a valid SSL setup.
-
-It would also make your contrastive validation population much more stable across runs.
-
----
-
-# 9. Your `val_loss` in supervised is intentionally recording-level, but the variable name hides that
-
-You calculate:
-
-```text
-window logits
-   ↓
-mean logits by recording
-   ↓
-CrossEntropyLoss
-```
-
-So:
-
-```python
-val_loss
-```
-
-really means:
-
-```text
-recording-level aggregated-logit CE
-```
-
-while:
-
-```python
-val_window_acc
-```
-
-is window-level accuracy.
-
-I'd consider naming or documenting it explicitly, e.g.:
-
-```python
-recording_val_loss
-```
-
-or keeping `val_loss` but adding a comment/docstring explaining the exact metric definition.
-
-For a research repository, metric definitions matter more than compact naming.
-
----
-
-# 10. Minor: `val_loss_total` in supervised is currently computed but discarded
-
-Inside validation:
-
-```python
-val_loss_total += loss.item() * labels.size(0)
-```
-
-but afterward you don't use it.
-
-Your actual loss is:
-
-```python
-rec_loss = criterion(rec_logits, rec_targets)
-avg_val_loss = rec_loss.item()
-```
-
-So:
-
-```python
-val_loss_total
-```
-
-can simply be removed.
-
-That makes the validation code clearer and avoids implying that window-level loss contributes to the final validation metric.
-
----
-
-# 11. Minor: unused imports
-
-I see:
-
-```python
-Tuple
-```
-
-unused in supervised.
-
-Also:
-
-```python
-log_memory_usage
-```
-
-appears unused in both.
-
-And:
-
-```python
-segment_size = self.config["audio"]["segment_size"]
-```
-
-inside supervised `train()` appears unused.
-
-Clean these before committing.
-
----
-
-# 12. One architectural improvement I'd make now: centralize RNG state
-
-You've reached the point where both trainers are duplicating:
-
-```text
-Python
-NumPy
-Torch
-CUDA
-```
-
-state handling.
-
-I'd move this into something like:
-
-```text
-src/utils/random_state.py
-```
-
-with:
-
-```python
-def get_rng_state()
-def set_rng_state(state)
-```
-
-Then the checkpoint callback owns serialization and both trainers simply restore it.
-
-That eliminates the risk of what happened here:
-
-```text
-SSL:
-    restores NumPy ✅
-
-Supervised:
-    doesn't restore NumPy ❌
-
-SSL:
-    calls random.setstate ✅ conceptually
-
-Supervised:
-    eventually will too
-
-both:
-    forgot import random ❌
-```
-
-Centralization makes this class of bug much harder to introduce.
-
----
-
-# Current status
-
-I'd rate the two trainers now as:
-
-| Area                                  | Status                   |
-| ------------------------------------- | ------------------------ |
-| Recording-level supervised evaluation | ✅                        |
-| Best-checkpoint selection             | ✅                        |
-| Compile-safe checkpoint loading       | ✅                        |
-| Callback ordering                     | ✅                        |
-| Trainer best-state resume             | ✅                        |
-| SSL checkpoint encoder extraction     | ✅                        |
-| NumPy RNG in SSL                      | ✅                        |
-| Python RNG                            | ⚠️ missing import        |
-| Full RNG restoration in supervised    | ❌                        |
-| Empty SSL validation handling         | ⚠️                       |
-| SSL stratified split                  | ⚠️                       |
-| Scheduler consistency                 | ⚠️ earlier issue remains |
-| Experiment architecture               | ✅                        |
-
-### The immediate patch set
-
-Before running the next sweep, I'd make these changes:
-
-```text
-1. import random in both trainers
-2. restore NumPy + Python RNG in supervised
-3. reject/handle empty SSL validation
-4. change scheduler total_steps to warmup_steps + 1 minimum
-5. remove unused imports/variables
-```
-
-After those, I would consider the **training + checkpoint/resume path ready for a controlled sanity run** before spending GPU time on a broad sweep.
