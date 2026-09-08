@@ -7,6 +7,7 @@ import torch.nn as nn
 from .audio_transformer_input import AudioTransformerInput
 from .transformer_block import TransformerBlock
 
+
 class Encoder(nn.Module):
     def __init__(
         self,
