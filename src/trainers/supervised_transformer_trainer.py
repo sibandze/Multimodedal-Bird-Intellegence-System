@@ -27,8 +27,8 @@ from .callbacks import (
     _unwrap_compile,
 )
 
-
 # ── helpers ─────────────────────────────────────────────────────────────
+
 
 def supervised_val_collate_fn(batch):
     """Collate for validation/test batches of (x, y, recording_id)."""
@@ -59,6 +59,7 @@ def aggregate_recordings(logits_all, labels_all, recording_ids_all):
 
 
 # ── trainer ─────────────────────────────────────────────────────────────
+
 
 class SupervisedTransformerExperimentTrainer(BaseTrainer):
     """Supervised classification training engine with callback-driven
@@ -154,9 +155,7 @@ class SupervisedTransformerExperimentTrainer(BaseTrainer):
 
         self.label_to_idx = train_dataset.label_to_idx
         self.idx_to_label = train_dataset.idx_to_label
-        self.class_names = [
-            self.idx_to_label[i] for i in range(len(self.idx_to_label))
-        ]
+        self.class_names = [self.idx_to_label[i] for i in range(len(self.idx_to_label))]
 
         val_dataset = None
         if len(val_df) > 0:
@@ -198,9 +197,7 @@ class SupervisedTransformerExperimentTrainer(BaseTrainer):
             persistent_workers=num_workers > 0,
         )
 
-        self.train_loader = DataLoader(
-            train_dataset, shuffle=True, **loader_kw
-        )
+        self.train_loader = DataLoader(train_dataset, shuffle=True, **loader_kw)
 
         self.val_loader = None
         if val_dataset is not None and len(val_dataset) > 0:
@@ -286,9 +283,7 @@ class SupervisedTransformerExperimentTrainer(BaseTrainer):
                 leave=False,
             )
         ):
-            self.cb_runner.on_batch_begin(
-                self, batch_idx, {"batch": batch_idx}
-            )
+            self.cb_runner.on_batch_begin(self, batch_idx, {"batch": batch_idx})
 
             mel_segments = mel_segments.to(self.device)
             labels = labels.to(self.device)
@@ -398,20 +393,12 @@ class SupervisedTransformerExperimentTrainer(BaseTrainer):
 
         best_ckpt_path = self.run_dir / "checkpoint_best.pth"
         if not best_ckpt_path.exists():
-            print(
-                "WARNING: No best checkpoint found. Using current model weights."
-            )
+            print("WARNING: No best checkpoint found. Using current model weights.")
         else:
-            best_ckpt = torch.load(
-                best_ckpt_path, weights_only=False
-            )
-            _unwrap_compile(self.model).load_state_dict(
-                best_ckpt["model_state_dict"]
-            )
+            best_ckpt = torch.load(best_ckpt_path, weights_only=False)
+            _unwrap_compile(self.model).load_state_dict(best_ckpt["model_state_dict"])
 
-        return self._evaluate(
-            self.model, self.test_loader, self.class_names
-        )
+        return self._evaluate(self.model, self.test_loader, self.class_names)
 
     # ── evaluation ──────────────────────────────────────────────────────
     def _evaluate(
