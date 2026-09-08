@@ -7,6 +7,7 @@ import librosa.display
 import matplotlib.pyplot as plt
 import numpy as np
 
+
 def generate_mel_spectrogram_data(
     audio_path: Union[str, Path],
     sr: int = 32000,
@@ -37,6 +38,7 @@ def generate_mel_spectrogram_data(
         print(f"Error generating Mel spectrogram data for {audio_path}: {e}")
         return None, None
 
+
 def save_spectrogram_npy(
     spectrogram_data: np.ndarray, out_path: Union[str, Path]
 ) -> Path:
@@ -44,6 +46,7 @@ def save_spectrogram_npy(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(out_path, spectrogram_data)
     return out_path
+
 
 def preprocess_and_save(
     audio_path: Union[str, Path],
@@ -63,11 +66,13 @@ def preprocess_and_save(
     save_spectrogram_npy(mel_db, out_path)
     return True
 
+
 def load_local_spectrogram(npy_path: Union[str, Path]) -> np.ndarray:
     npy_path = Path(npy_path)
     if not npy_path.exists():
         raise FileNotFoundError(f"Spectrogram not found: {npy_path}")
     return np.load(npy_path)
+
 
 def visualize_mel_spectrogram(
     spectrogram_data: np.ndarray,
@@ -83,6 +88,7 @@ def visualize_mel_spectrogram(
     plt.title(title)
     plt.tight_layout()
     plt.show()
+
 
 def save_spectrogram_image(
     spectrogram_data: np.ndarray,
