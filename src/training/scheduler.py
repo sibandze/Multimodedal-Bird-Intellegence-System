@@ -1,4 +1,4 @@
-# src/training/scheduler.py
+# src/trainers/scheduler.py
 """
 Learning rate scheduler factory.
 

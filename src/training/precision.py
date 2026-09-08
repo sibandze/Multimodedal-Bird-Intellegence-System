@@ -1,4 +1,4 @@
-# src/training/precision.py
+# src/trainers/precision.py
 """
 Precision Manager.
 

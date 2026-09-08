@@ -1,4 +1,4 @@
-# src/training/callbacks.py
+# src/trainers/callbacks.py
 
 # TODO:
 # Add LearningRateMonitorCallback.
@@ -26,6 +26,8 @@ import matplotlib.pyplot as plt
 
 try:
     import wandb
+    import logging
+    logger = logging.getLogger(__name__)
 except ImportError:
     wandb = None
 
@@ -217,6 +219,7 @@ class CheckpointCallback(Callback):
             "epoch": epoch + 1,
             "logs": logs,
             "model_state_dict": raw_model.state_dict(),
+            "trainer_state": trainer.trainer_state(),
             "optimizer_state_dict": trainer.optimizer.state_dict(),
             "scheduler_state_dict": (
                 trainer.scheduler.state_dict() if trainer.scheduler else None
@@ -317,54 +320,94 @@ class CSVLoggerCallback(Callback):
 # 5. WandB Logger Callback
 # =====================================================================
 class WandBLoggerCallback(Callback):
-    def __init__(self, config: Dict[str, Any], run_dir: Path):
+    def __init__(self, config: Dict[str, Any], run_dir: Path, max_failures: int = 3):
         self.config = config
         self.run_dir = Path(run_dir)
         self.enabled = (
             config.get("logging", {}).get("use_wandb", False) and wandb is not None
         )
+        self._failure_count = 0
+        self._max_failures = max_failures
+        self._wandb_initialized = False
+
+    def _disable(self, reason: str):
+        """Disable further W&B logging after repeated failures."""
+        if self.enabled:
+            logger.warning(f"WandB logging disabled: {reason}")
+            self.enabled = False
+
+    def _handle_error(self, context: str, exc: Exception):
+        """Handle a wandb error: log warning and maybe disable the callback."""
+        self._failure_count += 1
+        logger.warning(
+            f"WandB error during {context}: {exc}. "
+            f"Failure count: {self._failure_count}/{self._max_failures}"
+        )
+        if self._failure_count >= self._max_failures:
+            self._disable(f"too many consecutive failures ({self._failure_count})")
 
     def on_train_begin(self, trainer):
         if not self.enabled:
             return
         log_cfg = self.config.get("logging", {})
-        wandb.init(
-            project=log_cfg.get("wandb_project", "bird-song-classifier"),
-            name=log_cfg.get("wandb_run_name", self.run_dir.name),
-            config=self.config,
-            dir=str(self.run_dir),
-            resume="allow",
-            id=log_cfg.get("wandb_run_id", self.run_dir.name),
-        )
-        wandb.watch(trainer.model, log="gradients", log_freq=100)
+        try:
+            wandb.init(
+                project=log_cfg.get("wandb_project", "bird-song-classifier"),
+                name=log_cfg.get("wandb_run_name", self.run_dir.name),
+                config=self.config,
+                dir=str(self.run_dir),
+                resume="allow",
+                id=log_cfg.get("wandb_run_id", self.run_dir.name),
+            )
+            wandb.watch(trainer.model, log="gradients", log_freq=100)
+            self._wandb_initialized = True
+            self._failure_count = 0  # reset on success
+        except Exception as e:
+            self._handle_error("initialization", e)
+            self._wandb_initialized = False
 
     def on_epoch_end(self, trainer, epoch: int, logs: Dict[str, Any]):
-        if not self.enabled:
+        if not self.enabled or not self._wandb_initialized:
             return
-        wandb.log(logs, step=epoch)
+        try:
+            wandb.log(logs, step=epoch)
+            self._failure_count = 0  # reset on success
+        except Exception as e:
+            self._handle_error("log", e)
 
     def on_train_end(self, trainer):
         if not self.enabled:
             return
+        try:
+            if self._wandb_initialized:
+                state = getattr(trainer, "trainer_state", {})
+                monitor = getattr(trainer, "best_monitor", None)
+                best_value = state.get("best_metric")
 
-        if hasattr(trainer, "best_val_acc"):
-            wandb.summary["best_val_acc"] = trainer.best_val_acc
-        elif hasattr(trainer, "best_loss"):
-            wandb.summary["best_val_loss"] = trainer.best_loss
+                if monitor == "val_acc":
+                    wandb.summary["best_val_acc"] = best_value
+                elif monitor == "val_loss":
+                    wandb.summary["best_val_loss"] = best_value
 
-        if hasattr(trainer, "best_epoch"):
-            wandb.summary["best_epoch"] = trainer.best_epoch
+                if "best_epoch" in state:
+                    wandb.summary["best_epoch"] = state["best_epoch"]
 
-        for file in [
-            "confusion_matrix.png",
-            "per_class_metrics.png",
-            "evaluation_metrics.json",
-        ]:
-            path = self.run_dir / file
-            if path.exists():
-                wandb.save(str(path), base_path=str(self.run_dir))
-        wandb.finish()
-
+                for file in [
+                    "confusion_matrix.png",
+                    "per_class_metrics.png",
+                    "evaluation_metrics.json",
+                ]:
+                    path = self.run_dir / file
+                    if path.exists():
+                        wandb.save(str(path), base_path=str(self.run_dir))
+            wandb.finish()
+        except Exception as e:
+            self._handle_error("finalization", e)
+            # Even if finish fails, try to avoid leaving a hung process
+            try:
+                wandb.finish(exit_code=1)
+            except Exception:
+                pass
 
 # =====================================================================
 # 6. Plot Metrics Callback
