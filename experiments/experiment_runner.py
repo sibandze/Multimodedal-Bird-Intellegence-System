@@ -10,6 +10,8 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 import random
+import warnings
+
 import numpy as np
 import pandas as pd
 import torch
@@ -94,42 +96,62 @@ class ExperimentManager:
             csv_path = resolve_metadata_csv_path(self.base_config)
             if not os.path.exists(csv_path):
                 raise FileNotFoundError(
-                    f"Processed CSV not found at {csv_path}.",
-                    f"Run data pipeline first: python main.py --pipeline"
+                   f"Processed CSV not found at {csv_path}.",
+                   f"Run data pipeline first: python main.py --pipeline"
                 )
             full_df = pd.read_csv(csv_path)
             print(f"✓ Loaded {len(full_df)} samples from {csv_path}")
 
             # ---- Distillation ----
             data_cfg = self.base_config.get('data', {})
-            num_classes = data_cfg.get('num_classes')
-            num_samples_per_class = data_cfg.get('num_samples_per_class')
+            requested_classes = data_cfg.get('num_classes')
+            requested_samples = data_cfg.get('num_samples_per_class')
             label_col = data_cfg.get('label_column')
 
-            if num_classes and num_samples_per_class:
-                print(f"🔬 Distilling dataset to {num_classes} classes x {num_samples_per_class} samples each")
+            if requested_classes and requested_samples:
+                print(f"🔬 Distilling dataset to {requested_classes} classes x {requested_samples} samples each")
 
                 # Group by label
                 grouped = full_df.groupby(label_col)
                 class_counts = grouped.size().sort_values(ascending=False)
 
-                # Select top num_classes with enough samples
-                eligible_classes = class_counts[class_counts >= num_samples_per_class]
-                if len(eligible_classes) < num_classes:
-                    raise ValueError(
-                        f"Only {len(eligible_classes)} classes have at least {num_samples_per_class} samples. "
-                        f"Need {num_classes}. Reduce num_classes or increase data."
-                    )
+                # Check how many classes have enough samples
+                eligible_classes = class_counts[class_counts >= requested_samples]
 
-                selected_classes = eligible_classes.index[:num_classes].tolist()
-                print(f"   Selected classes: {selected_classes}")
+                if len(eligible_classes) < requested_classes:
+                    # Auto-reduce to the highest common number
+                    # Find the maximum samples per class available for the top requested_classes
+                    top_class_counts = class_counts.head(requested_classes)
+                    max_possible = int(top_class_counts.min())
+
+                    warnings.warn(
+                        f"Only {len(eligible_classes)} classes have at least {requested_samples} samples. "
+                        f"Auto-reducing samples per class to {max_possible} (max common across top {requested_classes} classes)."
+                    )
+                    requested_samples = max_possible
+
+                    # Re-check eligibility with reduced samples
+                    eligible_classes = class_counts[class_counts >= requested_samples]
+
+                    if len(eligible_classes) < requested_classes:
+                        # If still not enough, reduce number of classes too
+                        new_num_classes = len(eligible_classes)
+                        warnings.warn(
+                            f"Still only {len(eligible_classes)} classes available with {requested_samples} samples. "
+                            f"Auto-reducing num_classes to {new_num_classes}."
+                        )
+                        requested_classes = new_num_classes
+
+                selected_classes = eligible_classes.index[:requested_classes].tolist()
+                print(f"   Selected {len(selected_classes)} classes with {requested_samples} samples each")
+                print(f"   Classes: {selected_classes}")
 
                 # Sample per class
                 sampled_dfs = []
                 rng = np.random.RandomState(self.seed)
                 for cls in selected_classes:
                     cls_df = full_df[full_df[label_col] == cls]
-                    sampled = cls_df.sample(n=num_samples_per_class, random_state=rng)
+                    sampled = cls_df.sample(n=requested_samples, random_state=rng)
                     sampled_dfs.append(sampled)
 
                 self.df = pd.concat(sampled_dfs, ignore_index=True)
@@ -137,6 +159,10 @@ class ExperimentManager:
 
                 # Optional: shuffle the final dataset
                 self.df = self.df.sample(frac=1, random_state=rng).reset_index(drop=True)
+
+                # Update config with actual values used
+                self.base_config['data']['num_classes'] = requested_classes
+                self.base_config['data']['num_samples_per_class'] = requested_samples
             else:
                 # If no distillation requested, use full dataset
                 self.df = full_df
@@ -283,7 +309,7 @@ class ExperimentManager:
             if mode == "ssl":
                 trainer = SimCLRExperimentTrainer(run_config, run_dir)
             else:
-                trainer = SupervisedExperimentTrainer(run_config, run_dir)
+                trainer = SupervisedTransformerExperimentTrainer(run_config, run_dir)
 
             print(f"\n  [{run_index}] [{mode}] Training: {hyperparams}")
             print(f"      Seed: {run_seed}")
