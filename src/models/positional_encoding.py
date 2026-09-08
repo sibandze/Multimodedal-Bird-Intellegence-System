@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 
+
 class PositionalEncoding(nn.Module):
     def __init__(self, embed_dim: int, max_len: int = 1000) -> None:
         super().__init__()
