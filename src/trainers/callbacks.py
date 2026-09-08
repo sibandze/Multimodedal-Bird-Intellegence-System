@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 try:
     import wandb
     import logging
+
     logger = logging.getLogger(__name__)
 except ImportError:
     wandb = None
@@ -155,7 +156,7 @@ class EarlyStoppingCallback(Callback):
             if self.patience_counter >= self.patience:
                 print(
                     f"\n ⏹ Early stopping triggered!",
-                    f"No improvement in '{self.monitor}' for {self.patience} epochs."
+                    f"No improvement in '{self.monitor}' for {self.patience} epochs.",
                 )
                 trainer.request_stop()
 
@@ -228,17 +229,13 @@ class CheckpointCallback(Callback):
             "callbacks_state_dict": trainer.cb_runner.state_dict(),
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state": (
-                torch.cuda.get_rng_state_all()
-                if torch.cuda.is_available()
-                else None
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             ),
             "numpy_rng_state": np.random.get_state(),
             "python_rng_state": random.getstate(),
             "git_commit": getattr(trainer, "git_hash", None),
             "torch_version": torch.__version__,
-            "cuda_version": (
-                torch.version.cuda if torch.cuda.is_available() else None
-            ),
+            "cuda_version": (torch.version.cuda if torch.cuda.is_available() else None),
         }
 
     def on_epoch_end(self, trainer, epoch: int, logs: Dict[str, Any]):
@@ -272,8 +269,7 @@ class CheckpointCallback(Callback):
             torch.save(weights, self.run_dir / "best_model.pth")
 
             print(
-                f"    ✓ Saved new best model "
-                f"({self.monitor}: {current_score:.4f})"
+                f"    ✓ Saved new best model " f"({self.monitor}: {current_score:.4f})"
             )
 
     def state_dict(self) -> Dict[str, Any]:
@@ -408,6 +404,7 @@ class WandBLoggerCallback(Callback):
                 wandb.finish(exit_code=1)
             except Exception:
                 pass
+
 
 # =====================================================================
 # 6. Plot Metrics Callback
