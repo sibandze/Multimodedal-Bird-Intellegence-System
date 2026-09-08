@@ -3,6 +3,7 @@
 Mel Spectrogram -> AudioTransformerInput -> Transformer Encoder
 -> CLS Token (out[:, 0]) -> LayerNorm -> Linear -> GELU -> Dropout -> Linear -> Logits
 """
+
 from typing import Any, Dict, Optional
 
 import torch
@@ -10,11 +11,15 @@ import torch.nn as nn
 
 from .encoder import Encoder
 
+
 class SupervisedTransformer(nn.Module):
     """Supervised Transformer Classifier for Bird Species ID."""
 
     def __init__(
-        self, config: Dict[str, Any], num_classes: int, device: torch.device | str = "cpu"
+        self,
+        config: Dict[str, Any],
+        num_classes: int,
+        device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
         audio_cfg: Dict[str, Any] = config["audio"]
