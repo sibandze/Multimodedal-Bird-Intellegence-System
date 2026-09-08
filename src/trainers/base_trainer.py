@@ -16,6 +16,7 @@ from .scheduler import create_scheduler, get_scheduler_step_frequency
 from src.utils.memory_utils import get_gpu_memory_info
 from .callbacks import Callback, CallbackRunner
 
+
 class BaseTrainer(ABC):
     """
     Abstract base trainer implementing shared training infrastructure.
@@ -59,9 +60,7 @@ class BaseTrainer(ABC):
             else "cpu"
         )
         self.precision = PrecisionManager(
-            enabled=config["training"]
-            .get("mixed_precision", {})
-            .get("enabled", True),
+            enabled=config["training"].get("mixed_precision", {}).get("enabled", True),
             device=self.device.type,
             use_bfloat16=config["training"]
             .get("mixed_precision", {})
@@ -71,12 +70,9 @@ class BaseTrainer(ABC):
         # ── git hash (for checkpoint provenance) ────────────────────────
         try:
             import subprocess
+
             self.git_hash = (
-                subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"]
-                )
-                .decode()
-                .strip()
+                subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
             )
         except Exception:
             self.git_hash = None
@@ -88,9 +84,7 @@ class BaseTrainer(ABC):
         if not hasattr(self, "best_mode"):
             self.best_mode = "min"
 
-        self.best_metric_value = (
-            float("inf") if self.best_mode == "min" else 0.0
-        )
+        self.best_metric_value = float("inf") if self.best_mode == "min" else 0.0
         self.best_epoch = 0
         self.trainer_state: Dict[str, Any] = {
             "best_metric": self.best_metric_value,
@@ -155,9 +149,7 @@ class BaseTrainer(ABC):
             self._last_val_metrics = val_metrics
 
             epoch_duration = time.time() - epoch_start
-            logs = self._build_logs(
-                epoch, train_metrics, val_metrics, epoch_duration
-            )
+            logs = self._build_logs(epoch, train_metrics, val_metrics, epoch_duration)
             self._print_epoch_summary(logs)
             self.cb_runner.on_epoch_end(self, epoch, logs)
 
@@ -333,9 +325,7 @@ class BaseTrainer(ABC):
             self.best_metric_value = self.trainer_state.get(
                 "best_metric", self.best_metric_value
             )
-            self.best_epoch = self.trainer_state.get(
-                "best_epoch", self.best_epoch
-            )
+            self.best_epoch = self.trainer_state.get("best_epoch", self.best_epoch)
             # Subclass hook for legacy key migration (best_val_acc → best_metric, etc.)
             self._restore_best_from_state(self.trainer_state)
 
@@ -372,9 +362,8 @@ class BaseTrainer(ABC):
         if current is None:
             return False
 
-        improved = (
-            (self.best_mode == "min" and current < self.best_metric_value)
-            or (self.best_mode == "max" and current > self.best_metric_value)
+        improved = (self.best_mode == "min" and current < self.best_metric_value) or (
+            self.best_mode == "max" and current > self.best_metric_value
         )
         if improved:
             self.best_metric_value = current
