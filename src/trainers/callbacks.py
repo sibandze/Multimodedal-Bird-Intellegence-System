@@ -219,7 +219,7 @@ class CheckpointCallback(Callback):
             "epoch": epoch + 1,
             "logs": logs,
             "model_state_dict": raw_model.state_dict(),
-            "trainer_state": trainer.trainer_state(),
+            "trainer_state": trainer.trainer_state,
             "optimizer_state_dict": trainer.optimizer.state_dict(),
             "scheduler_state_dict": (
                 trainer.scheduler.state_dict() if trainer.scheduler else None
