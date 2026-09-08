@@ -5,11 +5,14 @@ import math
 import torch
 import torch.nn as nn
 
+
 class SelfAttention(nn.Module):
     def __init__(self, embed_size: int, heads: int, dropout: float = 0.0) -> None:
         super().__init__()
         if embed_size % heads != 0:
-            raise ValueError(f"embed_size {embed_size} must be divisible by heads {heads}")
+            raise ValueError(
+                f"embed_size {embed_size} must be divisible by heads {heads}"
+            )
 
         self.embed_size: int = embed_size
         self.heads: int = heads
