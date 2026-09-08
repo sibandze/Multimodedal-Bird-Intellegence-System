@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from .self_attention import SelfAttention
 
+
 class TransformerBlock(nn.Module):
     def __init__(
         self, embed_size: int, heads: int, dropout: float, forward_expansion: int
