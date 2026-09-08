@@ -18,15 +18,16 @@ import csv
 from tqdm import tqdm
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))
 
 from src.utils.configs import (
     load_and_resolve_config,
     resolve_metadata_csv_path,
     set_nested_config,
 )
-from .sweep_configs import SWEEP_SUITES
-from src.trainers import SupervisedExperimentTrainer
+from experiments.sweep_configs import SWEEP_SUITES
+from src.trainers import SupervisedTransformerExperimentTrainer
 from src.trainers import SimCLRExperimentTrainer
 
 

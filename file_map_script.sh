@@ -30,6 +30,8 @@ IGNORE_PATTERNS=(
   "*.egg-info"
   ".DS_Store"
   "node_modules"
+  "*.ogg"
+  "*.npy"
 )
 
 print_map() {

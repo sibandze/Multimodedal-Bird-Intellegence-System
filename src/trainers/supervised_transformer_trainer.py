@@ -60,7 +60,7 @@ def aggregate_recordings(logits_all, labels_all, recording_ids_all):
 
 # ── trainer ─────────────────────────────────────────────────────────────
 
-class SupervisedExperimentTrainer(BaseTrainer):
+class SupervisedTransformerExperimentTrainer(BaseTrainer):
     """Supervised classification training engine with callback-driven
     architecture and recording-level evaluation."""
 
