@@ -5,8 +5,8 @@ data:
   data_csv: "data/birds_voices.csv"
   num_classes: 10
   num_samples_per_class: 50
-  label_column: "scientific_id"
-  
+  label_column: "scientific_name_id"
+
 audio:
   sr: 32000
   n_fft: 2048
