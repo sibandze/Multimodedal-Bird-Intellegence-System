@@ -25,9 +25,9 @@ from src.utils.configs import (
     resolve_metadata_csv_path,
     set_nested_config,
 )
-from experiments.sweep_configs import SWEEP_SUITES
-from src.training.supervised_experiment_train import SupervisedExperimentTrainer
-from src.training.ssl_simclr_train import SimCLRExperimentTrainer
+from .sweep_configs import SWEEP_SUITES
+from src.trainers import SupervisedExperimentTrainer
+from src.trainers import SimCLRExperimentTrainer
 
 
 # Which suites are SSL vs supervised (by naming convention)
