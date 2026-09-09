@@ -1,6 +1,6 @@
 {
     "name": "Bird Intelligence System Environment",
-    "image": "mcr.microsoft.com/devcontainers/python:3.10",
+    "image": "mcr.microsoft.com/devcontainers/python:3.13",
 
     // Automatically install your dependencies right after the container is built
     "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt",
@@ -18,7 +18,7 @@
 
     // Runs the container as non-root for security and permission mapping sanity
     "remoteUser": "vscode",
-    
+
     "features": {
         "ghcr.io/devcontainers/features/sshd:1": {
             "version": "latest"
