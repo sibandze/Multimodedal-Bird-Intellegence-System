@@ -539,7 +539,7 @@ def main():
             print(f"❌ Error: {e}")
             sys.exit(1)
 
-    run_index = 0
+    run_index = 1
 
     for sweep in sweep_suite:
         print(f"\n{'─'*80}")
